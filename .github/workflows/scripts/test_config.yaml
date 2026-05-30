@@ -466,6 +466,7 @@
     - vllm_ascend/spec_decode/extract_hidden_states_proposer.py
   tests:
     - tests/e2e/pull_request/one_card/spec_decode/test_extract_hidden_states.py
+    - tests/e2e/pull_request/one_card/spec_decode/test_extract_hidden_states_qwen35.py
 
 - name: spec_decode_medusa
   optional: true
