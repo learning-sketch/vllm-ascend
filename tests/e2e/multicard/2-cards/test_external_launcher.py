@@ -212,6 +212,57 @@ def test_qwen3_external_launcher_with_sleepmode_level2():
     assert proc.returncode == 0
 
 
+@pytest.mark.parametrize("model", MOE_MODELS)
+@patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "0"})
+@wait_until_npu_memory_free(target_free_percentage=0.95)
+def test_qwen3_moe_external_launcher_with_sleepmode_level2(model):
+    script = Path(__file__).parent.parent.parent.parent.parent / "examples" / "offline_external_launcher.py"
+    env = os.environ.copy()
+    model_path = snapshot_download(
+        model,
+        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+    )
+    cmd = [
+        sys.executable,
+        str(script),
+        "--model",
+        model_path,
+        "--tp-size",
+        "2",
+        "--node-size",
+        "1",
+        "--node-rank",
+        "0",
+        "--proc-per-node",
+        "2",
+        "--trust-remote-code",
+        "--enable-expert-parallel",
+        "--enable-sleep-mode",
+        "--temperature",
+        "0",
+        "--model-weight-gib",
+        "60",
+        "--sleep-mode-level",
+        "2",
+    ]
+
+    print(f"Running subprocess: {' '.join(cmd)}")
+    proc = subprocess.run(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=600,
+    )
+    output = proc.stdout.decode(errors="ignore")
+
+    print(output)
+
+    assert "Generated text:" in output
+    assert "Sleep and wake up successfully!!" in output
+    assert proc.returncode == 0
+
+
 @pytest.mark.skipif(
     DEVICE_NAME != "Ascend910B",
     reason="This test is only for Ascend910B devices.",
