@@ -103,6 +103,17 @@ def load_and_merge_safetensors(directory):
     return merged_dict
 
 
+def log_npu_mem(tag: str, rank: int) -> None:
+    """Print real device (HBM) usage at a key point of the sleep/wake flow."""
+    free_bytes, total_bytes = torch.npu.mem_get_info()
+    used_bytes = total_bytes - free_bytes
+    print(
+        f"[MEM][rank{rank}] {tag}: used={used_bytes / GiB_bytes:.2f}GiB "
+        f"free={free_bytes / GiB_bytes:.2f}GiB total={total_bytes / GiB_bytes:.2f}GiB",
+        flush=True,
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="External launcher Inference")
     parser.add_argument(
@@ -208,9 +219,11 @@ def main(
     outputs = llm.generate(prompts, sampling_params)
 
     if enable_sleep_mode:
+        log_npu_mem("0_after_load_and_generate", rank)
         if rank == 0:
             free_bytes_before_sleep, total = torch.npu.mem_get_info()
         llm.sleep(level=sleep_mode_level)
+        log_npu_mem(f"1_after_sleep_level{sleep_mode_level}", rank)
         if rank == 0:
             free_bytes_after_sleep, total = torch.npu.mem_get_info()
             freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
@@ -220,13 +233,17 @@ def main(
 
         if sleep_mode_level == 1:
             llm.wake_up()
+            log_npu_mem("2_after_wakeup_all", rank)
         else:
             llm.wake_up(tags=["weights"])
+            log_npu_mem("2_after_wakeup_weights_empty", rank)
             run_model = llm.llm_engine.model_executor.driver_worker.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(run_model)
             sd = load_and_merge_safetensors(model)
             run_model.load_weights(sd.items())
+            log_npu_mem("3_after_load_weights", rank)
             llm.wake_up(tags=["kv_cache"])
+            log_npu_mem("4_after_wakeup_kv_cache", rank)
 
         outputs_after_wakeup = llm.generate(prompts, sampling_params)
         if rank == 0:

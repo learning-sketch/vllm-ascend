@@ -213,7 +213,7 @@ def test_qwen3_external_launcher_with_sleepmode_level2():
 
 
 @pytest.mark.parametrize("model", MOE_MODELS)
-@patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "0"})
+@patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "0", "VLLM_BATCH_INVARIANT": "1"})
 @wait_until_npu_memory_free(target_free_percentage=0.95)
 def test_qwen3_moe_external_launcher_with_sleepmode_level2(model):
     script = Path(__file__).parent.parent.parent.parent.parent / "examples" / "offline_external_launcher.py"
