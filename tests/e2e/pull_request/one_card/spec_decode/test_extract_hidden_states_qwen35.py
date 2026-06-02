@@ -43,6 +43,8 @@ import torch
 from safetensors import safe_open
 from vllm import LLM, SamplingParams
 
+from vllm_ascend.utils import vllm_version_is
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 # Qwen3.5-0.8B is a hybrid model with interleaved linear_attention
@@ -57,6 +59,10 @@ def sampling_config():
     return SamplingParams(temperature=0.0, max_tokens=1)
 
 
+@pytest.mark.skipif(
+    vllm_version_is("0.21.0"),
+    reason="hybrid extract_hidden_states needs HiddenStateCacheSpec, which only exists on vLLM newer than 0.21.0",
+)
 def test_extract_hidden_states_qwen35_hybrid_smoke(sampling_config):
     """Smoke test for Qwen3.5 hybrid + extract_hidden_states on NPU."""
     with tempfile.TemporaryDirectory() as tmpdirname:
