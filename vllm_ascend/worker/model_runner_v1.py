@@ -60,7 +60,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
-    HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -91,6 +90,12 @@ if vllm_version_is("0.21.0"):
     )
 else:
     from vllm.v1.outputs import RoutedExpertsLists
+if not vllm_version_is("0.21.0"):
+    # HiddenStateCacheSpec marks extract_hidden_states cache-only layers; it does
+    # not exist on vLLM 0.21.0 and older, only on newer versions.
+    from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+else:
+    HiddenStateCacheSpec = None
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
@@ -4581,7 +4586,11 @@ class NPUModelRunner(GPUModelRunner):
                     # type so get_kv_cache_groups isolates this cache-only layer
                     # into its own group; downgrading to MLAAttentionSpec would
                     # break page-size unification on hybrid models (e.g. Qwen3.5).
-                    kv_cache_spec[layer_name] = HiddenStateCacheSpec(
+                    # On vLLM 0.21.0 (no HiddenStateCacheSpec) fall back to a plain
+                    # MLA spec, matching the previous behaviour on that version.
+                    from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec
+                    cache_only_spec_cls = HiddenStateCacheSpec or AscendMLAAttentionSpec
+                    kv_cache_spec[layer_name] = cache_only_spec_cls(
                         block_size=spec.block_size,
                         num_kv_heads=spec.num_kv_heads,
                         head_size=spec.head_size,
