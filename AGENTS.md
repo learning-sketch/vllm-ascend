@@ -417,3 +417,45 @@ Before merging, verify:
 - [vLLM Hardware Plugin RFC](https://github.com/vllm-project/vllm/issues/11162)
 - [Documentation](https://docs.vllm.ai/projects/ascend/en/latest/)
 - [Contributors Guide](https://docs.vllm.ai/projects/ascend/en/latest/community/contributors.html)
+
+---
+
+## Cursor Cloud specific instructions
+
+This section is for Cursor Cloud Agents on **CPU-only** VMs (no Ascend NPU / CANN). Full inference and E2E tests require Ascend hardware; see [testing.md](docs/source/developer_guide/contribution/testing.md).
+
+### One-time environment (after the VM update script)
+
+1. **Python 3.11** (repo supports `>=3.10,<3.12`; Ubuntu 24.04 ships 3.12): use `uv` and a project venv at `.venv`.
+2. **Upstream vLLM** at the commit in `docs/source/conf.py` (`main_vllm_commit`), checked out as `vllm-empty/` (matches CI `_pre_commit.yml`):
+   ```bash
+   git clone --depth 1 https://github.com/vllm-project/vllm.git vllm-empty
+   cd vllm-empty && git fetch --depth 1 origin <main_vllm_commit> && git checkout <main_vllm_commit> && cd ..
+   VLLM_TARGET_DEVICE=empty .venv/bin/pip install -e vllm-empty/ --extra-index-url https://download.pytorch.org/whl/cpu
+   .venv/bin/pip uninstall -y triton
+   ```
+3. **vllm-ascend** (CPU dev, no CANN kernels):
+   ```bash
+   export SOC_VERSION=ascend910b1 COMPILE_CUSTOM_KERNELS=0
+   .venv/bin/pip install -e . --no-build-isolation --no-deps
+   # Install runtime deps from requirements.txt (omit arctic-inference / memfabric* if they fail to build on x86)
+   ```
+4. Activate: `source .venv/bin/activate`
+
+Optional deps that often **fail to build without CANN** on x86: `arctic-inference`, `memfabric_hybrid`, `memcache_hybrid`, `uc-manager`. Unit tests under `tests/ut/` generally do not need them.
+
+### Commands (standard paths in this repo)
+
+| Task | Command |
+|------|---------|
+| Lint (CI parity) | `bash format.sh ci` (requires `pip install -r requirements-lint.txt` and `pre-commit install-hooks` once) |
+| Ruff only | `ruff check vllm_ascend/` |
+| Unit tests (CPU) | `TORCH_DEVICE_BACKEND_AUTOLOAD=0 SOC_VERSION=ascend910b1 pytest -sv tests/ut` |
+| Env diagnostics | `python collect_env.py` |
+
+### Gotchas
+
+- **`vllm serve` / `vllm --help` with the plugin installed** loads `vllm_ascend` and imports `torch_npu`, which needs CANN libraries (`libhccl.so`, etc.). On CPU-only VMs this fails unless you use an Ascend CANN container or install CANN and `source .../set_env.sh`.
+- **Unit tests** avoid that path via mocks; use `TORCH_DEVICE_BACKEND_AUTOLOAD=0` as in [testing.md](docs/source/developer_guide/contribution/testing.md).
+- **E2E** (`tests/e2e/`) requires real NPU hardware; do not expect them to pass in Cloud CPU VMs.
+- Pin **pytest** to `<9` if `triton-ascend` is installed (`requirements-dev.txt` / `triton-ascend` expect 8.3.x).
