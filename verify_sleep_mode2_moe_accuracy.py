@@ -218,7 +218,14 @@ def parse_args():
     parser.add_argument("--tp-size", type=int, default=2, help="Tensor parallel size (cards), default 2")
     parser.add_argument("--proc-per-node", type=int, default=2, help="Processes (ranks) on this node, default 2")
     parser.add_argument("--max-tokens", type=int, default=32)
-    parser.add_argument("--enforce-eager", action="store_true", help="Disable aclgraph for a simpler run")
+    # Default to eager: aclgraph capture pins weight memory addresses, which can
+    # break after level-2 sleep frees and reallocates weights. This matches the
+    # vllm-ascend reference example offline_weight_load.py (enforce_eager=True).
+    parser.add_argument(
+        "--enable-graph",
+        action="store_true",
+        help="Enable aclgraph (default is eager). Only use to specifically test graph mode.",
+    )
     return parser.parse_args()
 
 
@@ -243,7 +250,7 @@ def main():
                 world_size,
                 args.tp_size,
                 args.max_tokens,
-                args.enforce_eager,
+                not args.enable_graph,
             ),
         )
         proc.start()

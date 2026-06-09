@@ -98,7 +98,14 @@ def parse_args():
     parser.add_argument("--model", required=True, help="Local dir or model id (dense model, e.g. Qwen3-0.6B)")
     parser.add_argument("--tp-size", type=int, default=1, help="Tensor parallel size (use 1 for single card)")
     parser.add_argument("--max-tokens", type=int, default=32)
-    parser.add_argument("--enforce-eager", action="store_true", help="Disable aclgraph for a simpler run")
+    # Default to eager: aclgraph capture pins weight memory addresses, which can
+    # break after level-2 sleep frees and reallocates weights. This matches the
+    # vllm-ascend reference example offline_weight_load.py (enforce_eager=True).
+    parser.add_argument(
+        "--enable-graph",
+        action="store_true",
+        help="Enable aclgraph (default is eager). Only use to specifically test graph mode.",
+    )
     parser.add_argument(
         "--master-port",
         type=int,
@@ -139,7 +146,7 @@ def main():
     llm = LLM(
         model=model_dir,
         tensor_parallel_size=args.tp_size,
-        enforce_eager=args.enforce_eager,
+        enforce_eager=not args.enable_graph,
         trust_remote_code=True,
         distributed_executor_backend="external_launcher",
         seed=0,
