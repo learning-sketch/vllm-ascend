@@ -40,6 +40,84 @@ class AscendExtractHiddenStatesProposer(ExtractHiddenStatesProposer):
         super().__init__(vllm_config, device)
 
     @torch.inference_mode()
+    def _determine_batch_execution_and_padding(
+        self,
+        num_tokens: int,
+        use_cudagraphs: bool = True,
+    ) -> tuple[CUDAGraphMode, int, torch.Tensor | None]:
+        """Determine cudagraph mode and padded token count for this proposer step.
+
+        Same contract as upstream ``ExtractHiddenStatesProposer``, but follows
+        the Ascend model runner path: SP-pad ``num_tokens`` before dispatch,
+        and use ``runner._sync_metadata_across_dp`` for DP coordination when
+        data parallel size > 1. The upstream ``coordinate_batch_across_dp``
+        posts a ``[4, dp_size]`` tensor to the DP cpu_group while Ascend's
+        runner posts ``[2, dp_size]`` on the same group; mixing the two in one
+        step breaks the gloo collective.
+        """
+        assert self.runner is not None, (
+            "AscendExtractHiddenStatesProposer requires a runner reference "
+            "for _pad_for_sequence_parallelism / _sync_metadata_across_dp"
+        )
+
+        # SP padding must happen BEFORE DP sync (matches the main runner).
+        # The v2 NPUModelRunner does not implement
+        # _pad_for_sequence_parallelism; fail with a clear error instead of a
+        # confusing AttributeError if this proposer is paired with it.
+        if not hasattr(self.runner, "_pad_for_sequence_parallelism"):
+            raise NotImplementedError(
+                "The current model runner does not support sequence "
+                "parallelism padding (_pad_for_sequence_parallelism) required "
+                "for AscendExtractHiddenStatesProposer."
+            )
+        num_tokens = self.runner._pad_for_sequence_parallelism(num_tokens)
+
+        cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+            num_tokens,
+            valid_modes=({CUDAGraphMode.NONE} if not use_cudagraphs else None),
+        )
+        num_tokens_padded = batch_desc.num_tokens
+
+        num_tokens_across_dp = None
+        if self.vllm_config.parallel_config.data_parallel_size > 1:
+            # The v2 NPUModelRunner does not implement
+            # _sync_metadata_across_dp; fail with a clear error instead of a
+            # confusing AttributeError when data parallel size > 1.
+            if not hasattr(self.runner, "_sync_metadata_across_dp"):
+                raise NotImplementedError(
+                    "The current model runner does not support DP metadata "
+                    "synchronization (_sync_metadata_across_dp) required for "
+                    "data parallel size > 1."
+                )
+            # Reuse the runner's DP sync so the collective shape matches the
+            # main model forward. The cache-only drafter is never MoE, so
+            # ``is_draft_model=True`` makes this degenerate to a local
+            # broadcast (no collective); the SP-pad above keeps the value
+            # TP-aligned. ``dummy_run`` below issues the exact same call so
+            # busy and idle DP ranks always stay collective-balanced.
+            (
+                _max_tokens_across_dp,
+                num_tokens_across_dp,
+                synced_cudagraph_mode,
+            ) = self.runner._sync_metadata_across_dp(
+                num_tokens=num_tokens_padded,
+                is_draft_model=True,
+                cudagraph_mode=cudagraph_mode,
+                allow_dp_padding=use_cudagraphs,
+            )
+
+            if num_tokens_across_dp is not None:
+                num_tokens_padded = int(num_tokens_across_dp[self.dp_rank].item())
+                # Re-dispatch with DP-synced padding.
+                cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+                    num_tokens_padded,
+                    valid_modes={synced_cudagraph_mode},
+                )
+                assert batch_desc.num_tokens == num_tokens_padded
+
+        return cudagraph_mode, num_tokens_padded, num_tokens_across_dp
+
+    @torch.inference_mode()
     def dummy_run(
         self,
         num_tokens,
@@ -57,9 +135,23 @@ class AscendExtractHiddenStatesProposer(ExtractHiddenStatesProposer):
         Same functional logic as GPU version but with Ascend's parameter signature.
         """
         assert self.model is not None, "Model must be initialized before dummy_run"
+        assert self.runner is not None, (
+            "AscendExtractHiddenStatesProposer requires a runner reference for _sync_metadata_across_dp"
+        )
 
-        if num_tokens_across_dp is not None:
-            num_tokens_across_dp[self.dp_rank] = num_tokens
+        # Mirror llm_base_proposer.dummy_run: every step on every DP rank must
+        # issue the same drafter DP sync that propose() issues on busy ranks
+        # (via _determine_batch_execution_and_padding). Otherwise, whenever
+        # _sync_metadata_across_dp(is_draft_model=True) performs a real
+        # all_reduce (e.g. hierarchical communication enabled), busy ranks
+        # post one more collective on the DP cpu_group than idle ranks running
+        # this dummy path, the ranks desynchronize, and the whole DP group
+        # deadlocks in the device-side MoE collectives.
+        (
+            num_tokens,
+            num_tokens_across_dp,
+            _,
+        ) = self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True)
 
         with set_forward_context(
             None,
