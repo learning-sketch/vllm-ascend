@@ -73,6 +73,8 @@ def test_extract_hidden_states_qwen35_hybrid_smoke(sampling_config):
             enforce_eager=True,
             gpu_memory_utilization=0.4,
             load_format="dummy",
+            # ExampleHiddenStatesConnector does not support chunked prefill.
+            enable_chunked_prefill=False,
             speculative_config={
                 "method": "extract_hidden_states",
                 "num_speculative_tokens": 1,
