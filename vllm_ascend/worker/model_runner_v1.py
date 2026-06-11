@@ -281,6 +281,21 @@ class NPUModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
+        # Replace the CUDA PrefetchOffloader set by parent __init__ with NPU version.
+        offload_cfg = vllm_config.offload_config
+        if (offload_cfg is not None
+                and getattr(offload_cfg, "prefetch", None) is not None
+                and getattr(offload_cfg.prefetch, "offload_group_size", 0) > 0):
+            from vllm.model_executor.offloader.base import set_offloader
+
+            from vllm_ascend.model_executor.offloader.prefetch import NPUPrefetchOffloader
+            set_offloader(NPUPrefetchOffloader(
+                group_size=offload_cfg.prefetch.offload_group_size,
+                num_in_group=offload_cfg.prefetch.offload_num_in_group,
+                prefetch_step=offload_cfg.prefetch.offload_prefetch_step,
+                offload_params=offload_cfg.prefetch.offload_params,
+            ))
+
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
         self.query_start_loc = self._make_buffer(
@@ -1079,7 +1094,7 @@ class NPUModelRunner(GPUModelRunner):
         should_rebuild_async_inputs = (
             self.use_cp
             and self.use_async_spec_decode
-            and self.valid_sampled_token_count_gpu is not None
+            and self.valid_sampled_token_count_gpu is not None # type: ignore[has-type]
             and prev_req_id_to_index
             and has_decode_req
         )
@@ -2999,8 +3014,8 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
-                blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
-
+                self.cpu_slot_mapping = blk_table.slot_mapping.cpu[:maybe_pcp_full_tokens]
+                blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]          
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
                 if self.pcp_size == 1:
@@ -3086,6 +3101,7 @@ class NPUModelRunner(GPUModelRunner):
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
+            slot_mapping_cpu=self.cpu_slot_mapping,
             causal=True,
             is_prefilling=is_prefilling,
             num_input_tokens=num_tokens_padded,
@@ -3631,6 +3647,9 @@ class NPUModelRunner(GPUModelRunner):
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
+
+        from vllm.model_executor.offloader.base import get_offloader
+        get_offloader().post_init()
 
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
