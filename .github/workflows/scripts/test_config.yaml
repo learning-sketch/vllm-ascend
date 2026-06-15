@@ -493,7 +493,6 @@
     - vllm_ascend/spec_decode/extract_hidden_states_proposer.py
   tests:
     - tests/e2e/pull_request/one_card/spec_decode/test_extract_hidden_states.py
-    - tests/e2e/pull_request/one_card/spec_decode/test_extract_hidden_states_qwen35.py
 
 - name: spec_decode_medusa
   optional: false
@@ -668,8 +667,7 @@ estimated_times:
   tests/e2e/pull_request/one_card/spec_decode/test_dflash.py: 230
   tests/e2e/pull_request/one_card/spec_decode/test_draft_parallel.py: 230
   tests/e2e/pull_request/one_card/spec_decode/test_eagle.py: 360
-  tests/e2e/pull_request/one_card/spec_decode/test_extract_hidden_states.py: 200
-  tests/e2e/pull_request/one_card/spec_decode/test_extract_hidden_states_qwen35.py: 200
+  tests/e2e/pull_request/one_card/spec_decode/test_extract_hidden_states.py: 400
   tests/e2e/pull_request/one_card/spec_decode/test_mtp_eagle_correctness.py: 190
   tests/e2e/pull_request/one_card/spec_decode/test_ngram.py: 150
   tests/e2e/pull_request/one_card/spec_decode/test_ngram_npu.py: 180
