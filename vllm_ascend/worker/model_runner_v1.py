@@ -88,14 +88,11 @@ if vllm_version_is("0.21.0"):
         get_global_experts_capturer,
         issue_routing_d2h_copy,
     )
-else:
-    from vllm.v1.outputs import RoutedExpertsLists
-if not vllm_version_is("0.21.0"):
-    # HiddenStateCacheSpec marks extract_hidden_states cache-only layers; it does
-    # not exist on vLLM 0.21.0 and older, only on newer versions.
-    from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
-else:
+
     HiddenStateCacheSpec = None
+else:
+    from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+    from vllm.v1.outputs import RoutedExpertsLists
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
