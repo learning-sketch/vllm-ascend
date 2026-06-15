@@ -454,7 +454,14 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         return super().forward(input_)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        if "wo_a" in self.prefix and get_ascend_device_type() != AscendDeviceType.A5:
+        # On A5 the MX-FP8 quantized ``wo_a`` keeps the raw ``[out, in]`` layout
+        # because its quant method performs the transpose in
+        # ``process_weights_after_loading``. For the unquantized BF16 case on A5
+        # — and for every non-A5 case — reshape ``wo_a`` into the per-group
+        # ``[n_local_groups, in_features, o_lora_rank]`` layout consumed by the
+        # batchmatmul o-projection.
+        a5_quantized = get_ascend_device_type() == AscendDeviceType.A5 and hasattr(self, "weight_scale")
+        if "wo_a" in self.prefix and not a5_quantized:
             if self.weight.ndim == 2:
                 super().weight_loader(param, loaded_weight)
                 self.weight.data = (

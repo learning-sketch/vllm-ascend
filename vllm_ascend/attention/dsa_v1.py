@@ -1649,7 +1649,12 @@ class AscendDSAImpl(DSAAttentionImpl):
         )
 
         # o
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
+        # On A5 the o-projection runs as an MX-FP8 quantized batchmatmul, which
+        # requires ``wo_a`` to carry a ``weight_scale`` (only created by the
+        # MX-FP8 quant method). For an unquantized BF16 ``wo_a`` there is no
+        # ``weight_scale``, so fall back to the plain batchmatmul path shared
+        # with non-A5 devices.
+        if get_ascend_device_type() in {AscendDeviceType.A5} and hasattr(self.wo_a, "weight_scale"):
             o = o_proj_input.view(num_tokens, self.n_local_groups, -1)
             o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
             o = torch_npu.npu_transpose_quant_batchmatmul(
