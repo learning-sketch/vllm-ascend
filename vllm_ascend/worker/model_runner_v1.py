@@ -91,7 +91,7 @@ if vllm_version_is("0.21.0"):
 
     HiddenStateCacheSpec = None
 else:
-    from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+    from vllm.v1.kv_cache_interface import HiddenStateCacheSpec  # type: ignore[no-redef, assignment]
     from vllm.v1.outputs import RoutedExpertsLists
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
