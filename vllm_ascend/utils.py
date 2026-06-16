@@ -1550,12 +1550,7 @@ def kv_cache_spec_uses_sparse_c8(kv_cache_spec) -> bool:
 
 
 def is_hidden_state_cache_spec(spec) -> bool:
-    """Whether ``spec`` marks an ``extract_hidden_states`` cache-only layer.
-
-    ``HiddenStateCacheSpec`` only exists on vLLM newer than 0.21.0.
-    """
-    if vllm_version_is("0.21.0"):
-        return False
+    """Whether ``spec`` marks an ``extract_hidden_states`` cache-only layer."""
     from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
 
     return isinstance(spec, HiddenStateCacheSpec)

@@ -22,8 +22,7 @@ states are correctly extracted and saved on the Ascend NPU. Parametrized over:
   weights so outputs can be checked to be non-zero, and
 * a hybrid attention model (Qwen3.5-0.8B, GatedDeltaNet + full_attention)
   loaded with dummy weights as a shape/round-trip smoke test. The hybrid case
-  mirrors upstream vLLM PR #39949 and only runs on vLLM newer than 0.21.0,
-  where HiddenStateCacheSpec exists.
+  mirrors upstream vLLM PR #39949.
 """
 
 from __future__ import annotations
@@ -36,8 +35,6 @@ import pytest
 import torch
 from safetensors import safe_open
 from vllm import LLM, SamplingParams
-
-from vllm_ascend.utils import vllm_version_is
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -110,12 +107,6 @@ CASES = [
             load_format="dummy",
             verify_nonzero=False,
             verify_token_ids=True,
-        ),
-        marks=pytest.mark.skipif(
-            vllm_version_is("0.21.0"),
-            reason=(
-                "hybrid extract_hidden_states needs HiddenStateCacheSpec, which only exists on vLLM newer than 0.21.0"
-            ),
         ),
         id="hybrid_dummy_eager",
     ),
