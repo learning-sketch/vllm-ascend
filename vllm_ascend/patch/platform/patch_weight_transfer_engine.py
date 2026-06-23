@@ -49,14 +49,35 @@
 #   Remove this patch when upstream vllm relaxes the Literal type to str
 #   or provides an extension point for out-of-tree backends.
 
+from vllm.distributed.weight_transfer.base import WeightTransferEngine
 from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 
-from vllm_ascend.distributed.weight_transfer.hccl_engine import (
-    HCCLWeightTransferEngine,
-)
-from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
-    NPUIPCWeightTransferEngine,
-)
 
-WeightTransferEngineFactory._registry["nccl"] = lambda: HCCLWeightTransferEngine
-WeightTransferEngineFactory._registry["ipc"] = lambda: NPUIPCWeightTransferEngine
+# The engine classes are imported lazily inside the loaders below — never at
+# module import time. This patch runs during global plugin patching (long
+# before any weight transfer backend is selected), and the NPU IPC engine
+# module transitively imports vllm.distributed.weight_transfer.ipc_engine,
+# which imports the optional ``ray`` dependency at module top level. Eagerly
+# importing it here crashes ``vllm serve`` for every workload when ray is not
+# installed, even when no weight transfer backend is used. Deferring the import
+# matches the lazy-loading contract of WeightTransferEngineFactory: each
+# registry entry is a zero-arg callable returning the engine class, invoked
+# only when the backend is actually requested.
+def _load_hccl_engine() -> type[WeightTransferEngine]:
+    from vllm_ascend.distributed.weight_transfer.hccl_engine import (
+        HCCLWeightTransferEngine,
+    )
+
+    return HCCLWeightTransferEngine
+
+
+def _load_npu_ipc_engine() -> type[WeightTransferEngine]:
+    from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
+        NPUIPCWeightTransferEngine,
+    )
+
+    return NPUIPCWeightTransferEngine
+
+
+WeightTransferEngineFactory._registry["nccl"] = _load_hccl_engine
+WeightTransferEngineFactory._registry["ipc"] = _load_npu_ipc_engine
