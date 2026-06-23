@@ -4,6 +4,16 @@ ROOT_DIR=$1
 SOC_VERSION=$2
 : "${ROOT_DIR:?ROOT_DIR is not set}"
 
+# Resolve ROOT_DIR to an absolute path. The cann-ops-transformer .run installer
+# rejects relative --install-path, and downstream the script cd's into
+# ${ROOT_DIR}/csrc, which would make a relative ROOT_DIR resolve install/output
+# dirs against the wrong base. Normalizing here keeps every derived path correct.
+if [[ ! -d "${ROOT_DIR}" ]]; then
+    echo "ERROR: ROOT_DIR '${ROOT_DIR}' is not a directory" >&2
+    exit 1
+fi
+ROOT_DIR="$(cd "${ROOT_DIR}" && pwd)"
+
 log() {
     echo "[build_aclnn] $*"
 }
@@ -221,6 +231,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "quant_lightning_indexer_metadata"
         "kv_quant_sparse_attn_sharedkv"
         "kv_quant_sparse_attn_sharedkv_metadata"
+        "sparse_flash_mla"
+        "sparse_flash_mla_metadata"
         "hc_pre_sinkhorn"
         "hc_pre_inv_rms"
         "hc_post"

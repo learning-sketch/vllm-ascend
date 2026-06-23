@@ -78,6 +78,7 @@ from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
 from vllm_ascend.utils import (
     AscendDeviceType,
+    dsv4_use_kv_bf16,
     enable_dsa_cp,
     extract_dsv4_layer_index,
     get_ascend_device_type,
@@ -184,10 +185,14 @@ class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
         self.block_size = _dsv4_block_sizes()[cache_config.block_size][0][1]
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
+        # A5 default path stores the SWA KV cache as FP8 with a trailing per-tile
+        # scale segment (head_dim + 128). The BF16 path keeps BF16 KV with no
+        # scale segment so sparse_flash_mla can consume it directly.
+        use_a5_fp8 = get_ascend_device_type() in {AscendDeviceType.A5} and not dsv4_use_kv_bf16()
+        if use_a5_fp8:
             self.dtype = torch.float8_e4m3fn
             vllm_config.cache_config.cache_dtype = "float8_e4m3fn"
-        cached_head_size = self.head_dim + 128 if get_ascend_device_type() in {AscendDeviceType.A5} else self.head_dim
+        cached_head_size = self.head_dim + 128 if use_a5_fp8 else self.head_dim
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -843,7 +848,11 @@ class DeepseekV4Attention(nn.Module):
                     skip_topk = pattern[indexer_seq_idx] == "S"
 
         ascend_device_type = get_ascend_device_type()
-        k_dtype = torch.float8_e4m3fn if ascend_device_type == AscendDeviceType.A5 else torch.bfloat16
+        k_dtype = (
+            torch.float8_e4m3fn
+            if (ascend_device_type == AscendDeviceType.A5 and not dsv4_use_kv_bf16())
+            else torch.bfloat16
+        )
         swa_cache_layer = AscendDeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,

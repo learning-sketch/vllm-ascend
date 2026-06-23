@@ -29,10 +29,19 @@ constexpr float fp8e4m3MaxValue = 448.0f;
 constexpr float int8MaxValue = 127.0f;
 constexpr float hifp8MaxValue = 32768.0f;
 constexpr float floatEps = 2.220446049250313e-16;
+constexpr float LN2 = static_cast<float>(0.6931471806f);
+constexpr float INV_LN2 = static_cast<float>(1.4426950409F);
 /* **************************************************************************************************
  * Muls + Select(optional) + SoftmaxFlashV2 + Cast(fp32->fp16/bf16) + ND2NZ
  * ************************************************************************************************* */
 using namespace MicroAPI;
+
+constexpr static AscendC::MicroAPI::CastTrait castTraitNoneZero = {
+    AscendC::MicroAPI::RegLayout::ZERO,
+    AscendC::MicroAPI::SatMode::UNKNOWN,
+    AscendC::MicroAPI::MaskMergeMode::ZEROING,
+    AscendC::RoundMode::CAST_NONE,
+};
 
 constexpr static AscendC::MicroAPI::CastTrait castTraitZero = {
     AscendC::MicroAPI::RegLayout::ZERO,
@@ -61,7 +70,7 @@ constexpr static AscendC::MicroAPI::CastTrait castTraitThree = {
     AscendC::MicroAPI::MaskMergeMode::ZEROING,
     AscendC::RoundMode::CAST_ROUND,
 };
-
+ 
 constexpr static AscendC::MicroAPI::CastTrait castTraitRintZero = {
     AscendC::MicroAPI::RegLayout::ZERO,
     AscendC::MicroAPI::SatMode::SAT,
@@ -75,7 +84,7 @@ constexpr static AscendC::MicroAPI::CastTrait castTraitRintOne = {
     AscendC::MicroAPI::MaskMergeMode::ZEROING,
     AscendC::RoundMode::CAST_RINT,
 };
-
+ 
 constexpr static AscendC::MicroAPI::CastTrait castTraitRintTwo = {
     AscendC::MicroAPI::RegLayout::TWO,
     AscendC::MicroAPI::SatMode::SAT,
@@ -95,7 +104,7 @@ constexpr static AscendC::MicroAPI::CastTrait castTraitRintThree = {
         Muls(vreg_exp, vreg_exp, fp8e4m3MaxValue, MaskReg);         \
         Div(vreg_exp, vreg_exp, vreg_rowmax_p, MaskReg);            \
     } while (0)
-
+    
 #define USE_MLA_FULLQUANT_V1_P_INT8(vreg_exp, vreg_rowmax_p, MaskReg) \
     do {                                                              \
         Muls(vreg_exp, vreg_exp, int8MaxValue, MaskReg);              \

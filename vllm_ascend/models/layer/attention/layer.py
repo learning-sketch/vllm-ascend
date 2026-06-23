@@ -24,6 +24,7 @@ from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.utils import (
     AscendDeviceType,
+    dsv4_use_kv_bf16,
     get_ascend_device_type,
 )
 
@@ -175,13 +176,15 @@ class DSAAttention(nn.Module, AttentionLayerBase):
         if self.compress_ratio <= 1:  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(self.kv_cache_dtype, vllm_config.model_config)
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
+        # On A5 the default DSA path stores the compressed KV cache as FP8 with a
+        # trailing per-tile scale segment (head_size + 128). The BF16 path keeps
+        # the KV cache in BF16 with no scale segment.
+        use_a5_fp8 = get_ascend_device_type() in {AscendDeviceType.A5} and not dsv4_use_kv_bf16()
+        if use_a5_fp8:
             kv_cache_dtype = torch.float8_e4m3fn
             vllm_config.cache_config.cache_dtype = "float8_e4m3fn"
 
-        cached_head_size = (
-            (self.head_size + 128) if get_ascend_device_type() in {AscendDeviceType.A5} else self.head_size
-        )
+        cached_head_size = (self.head_size + 128) if use_a5_fp8 else self.head_size
         return MLAAttentionSpec(
             block_size=DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0],
             num_kv_heads=1,
