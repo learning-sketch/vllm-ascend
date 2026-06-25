@@ -116,8 +116,13 @@ class NPUIPCWeightTransferEngine(WeightTransferEngine[NPUIPCWeightTransferInitIn
     init_info_cls = NPUIPCWeightTransferInitInfo
     update_info_cls = NPUIPCWeightTransferUpdateInfo
 
-    def __init__(self, config: WeightTransferConfig, parallel_config: ParallelConfig) -> None:
-        super().__init__(config, parallel_config)
+    def __init__(
+        self,
+        config: WeightTransferConfig,
+        parallel_config: ParallelConfig,
+        model: torch.nn.Module | None = None,
+    ) -> None:
+        super().__init__(config, parallel_config, model)
 
     def parse_update_info(self, update_dict: dict[str, Any]) -> NPUIPCWeightTransferUpdateInfo:
         """Parse update dict, deserializing pickled IPC handles if present.
@@ -306,8 +311,11 @@ class NPUIPCWeightTransferEngine(WeightTransferEngine[NPUIPCWeightTransferInitIn
 
             weight = tensor.detach().contiguous()
             weight_refs.append(weight)
-            _, ipc_args = reduce_tensor(weight)
-            ipc_handles.append({npu_uuid: ipc_args})
+            # ``reduce_tensor`` returns ``(rebuild_func, rebuild_args)``. The
+            # consumer in ``receive_weights`` unpacks the stored value as
+            # ``func, args``, so the full tuple must be kept (not just args).
+            ipc_handle = reduce_tensor(weight)
+            ipc_handles.append({npu_uuid: ipc_handle})
 
         ipc_handles = NPUIPCWeightTransferEngine._all_gather_and_merge_handles(ipc_handles)
 

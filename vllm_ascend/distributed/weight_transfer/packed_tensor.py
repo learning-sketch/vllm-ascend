@@ -218,7 +218,10 @@ def packed_npu_ipc_producer(
         buffer_size_bytes: Exact capacity of the reusable IPC buffer.
     """
     ipc_buffer = torch.empty(buffer_size_bytes, dtype=torch.uint8, device="npu")
-    _, ipc_args = reduce_tensor(ipc_buffer)
+    # ``reduce_tensor`` returns ``(rebuild_func, rebuild_args)``. The consumer
+    # (``packed_npu_ipc_consumer``) unpacks the stored value as ``func, args``,
+    # so the full tuple must be kept rather than just the args.
+    ipc_handle = reduce_tensor(ipc_buffer)
 
     names: list[str] = []
     shapes: list[list[int]] = []
@@ -243,7 +246,7 @@ def packed_npu_ipc_producer(
                 "shapes": shapes,
                 "dtype_names": [str(d).split(".")[-1] for d in dtypes],
                 "tensor_sizes": tensor_sizes,
-                "ipc_handle": {npu_uuid: ipc_args},
+                "ipc_handle": {npu_uuid: ipc_handle},
             }
             names, shapes, dtypes, tensor_sizes = [], [], [], []
             total_bytes = 0
@@ -262,7 +265,7 @@ def packed_npu_ipc_producer(
             "shapes": shapes,
             "dtype_names": [str(d).split(".")[-1] for d in dtypes],
             "tensor_sizes": tensor_sizes,
-            "ipc_handle": {npu_uuid: ipc_args},
+            "ipc_handle": {npu_uuid: ipc_handle},
         }
 
 
