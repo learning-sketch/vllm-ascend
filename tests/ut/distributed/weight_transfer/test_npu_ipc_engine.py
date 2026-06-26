@@ -22,13 +22,17 @@ These cover two bugs that broke ``examples/rl/rlhf_http_npu_ipc.py``:
    argument that ``WeightTransferEngineFactory.create_engine`` passes,
    raising ``TypeError: __init__() takes 3 positional arguments but 4
    were given`` at engine construction.
-2. The trainer side stored only the ``reduce_tensor`` *args* (dropping the
-   rebuild *func*), while ``receive_weights`` unpacked the stored value as
-   ``func, args``, raising ``ValueError: too many values to unpack
-   (expected 2)`` during ``update_weights``.
+2. ``receive_weights`` / ``packed_npu_ipc_consumer`` unpacked the stored
+   IPC handle as ``func, args`` even though the producer stored only the
+   ``reduce_tensor`` *args*, raising ``ValueError: too many values to
+   unpack (expected 2)``. Aligned with upstream vLLM's CUDA IPC engine:
+   the producer stores args only and the consumer rebuilds with the
+   well-known ``rebuild_npu_tensor``.
 """
 
 import inspect
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -39,6 +43,23 @@ from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
 )
 
 _MODULE = "vllm_ascend.distributed.weight_transfer.npu_ipc_engine"
+
+
+def _patch_rebuild_npu_tensor(rebuild_func):
+    """Install a fake ``torch_npu.multiprocessing.reductions`` module.
+
+    The engine imports ``rebuild_npu_tensor`` lazily from ``torch_npu``,
+    which is only a stub on CPU CI runners, so provide a fake submodule.
+    """
+    fake_mod = types.ModuleType("torch_npu.multiprocessing.reductions")
+    fake_mod.rebuild_npu_tensor = rebuild_func
+    return patch.dict(
+        sys.modules,
+        {
+            "torch_npu.multiprocessing": types.ModuleType("torch_npu.multiprocessing"),
+            "torch_npu.multiprocessing.reductions": fake_mod,
+        },
+    )
 
 
 def test_init_accepts_model_argument():
@@ -60,28 +81,16 @@ def test_init_passes_model_to_super():
     assert captured["args"] == ("config", "parallel_config", "model")
 
 
-def test_unpacked_send_keeps_full_reduce_tensor_handle():
-    """Bug 2: the stored IPC handle must be the full ``(func, args)`` tuple.
+def test_unpacked_send_stores_reduce_tensor_args_only():
+    """Bug 2 (producer): the handle stores only the ``reduce_tensor`` args.
 
-    Drives the unpacked trainer send and verifies the handle dict carries the
-    complete ``reduce_tensor`` result, then feeds the produced update info back
-    into ``receive_weights`` to confirm the round-trip unpacking works.
+    This matches upstream vLLM's CUDA IPC engine, which drops the rebuild
+    func and relies on the consumer using the well-known rebuild function.
     """
     npu_uuid = "node-0"
-    device_index = 0
 
-    rebuilt_weight = torch.tensor([1.0, 2.0, 3.0])
-
-    def rebuild_func(*args):
-        # Index 6 is the device index, which receive_weights overwrites.
-        assert args[6] == device_index
-        return rebuilt_weight
-
-    # ``reduce_tensor`` returns (rebuild_func, rebuild_args). The args tuple is
-    # longer than 2, which is precisely why dropping the func and unpacking the
-    # args as ``func, args`` used to raise "too many values to unpack".
     rebuild_args = (None, None, None, None, None, None, 999, None)
-    fake_reduce = MagicMock(return_value=(rebuild_func, rebuild_args))
+    fake_reduce = MagicMock(return_value=("rebuild_func_sentinel", rebuild_args))
 
     captured = {}
 
@@ -100,10 +109,37 @@ def test_unpacked_send_keeps_full_reduce_tensor_handle():
     update_info = captured["update_info"]
     assert isinstance(update_info.ipc_handles, list)
     stored = update_info.ipc_handles[0][npu_uuid]
-    # Must be the full (func, args) tuple, not just the args.
-    assert stored == (rebuild_func, rebuild_args)
+    # Only the args tuple is stored, not a (func, args) pair.
+    assert stored == rebuild_args
 
-    # Round-trip: receive_weights should unpack and rebuild without error.
+
+def test_receive_weights_rebuilds_with_rebuild_npu_tensor():
+    """Bug 2 (consumer): receive_weights rebuilds via ``rebuild_npu_tensor``.
+
+    Verifies the args-only handle is consumed without unpacking errors and
+    that the receiver's device index is written into the rebuild args.
+    """
+    npu_uuid = "node-0"
+    device_index = 0
+
+    rebuilt_weight = torch.tensor([1.0, 2.0, 3.0])
+    seen = {}
+
+    def fake_rebuild(*args):
+        seen["args"] = args
+        return rebuilt_weight
+
+    # Sender stores 999 at index 6; the receiver must overwrite it.
+    rebuild_args = (None, None, None, None, None, None, 999, None)
+
+    update_info = NPUIPCWeightTransferEngine.update_info_cls(
+        names=["model.weight"],
+        dtype_names=["float32"],
+        shapes=[[3]],
+        ipc_handles=[{npu_uuid: rebuild_args}],
+        packed=False,
+    )
+
     engine = object.__new__(NPUIPCWeightTransferEngine)
     received = {}
 
@@ -111,6 +147,7 @@ def test_unpacked_send_keeps_full_reduce_tensor_handle():
         received["weights"] = weights
 
     with (
+        _patch_rebuild_npu_tensor(fake_rebuild),
         patch(f"{_MODULE}.npu_generate_uuid", return_value=npu_uuid),
         patch("torch.accelerator.current_device_index", return_value=device_index),
     ):
@@ -118,3 +155,5 @@ def test_unpacked_send_keeps_full_reduce_tensor_handle():
 
     assert received["weights"][0][0] == "model.weight"
     assert torch.equal(received["weights"][0][1], rebuilt_weight)
+    # Index 6 (device index) overwritten with the receiver's device.
+    assert seen["args"][6] == device_index
