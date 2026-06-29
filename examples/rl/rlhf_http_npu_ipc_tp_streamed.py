@@ -145,18 +145,74 @@ def _streamed_full_param_iter(
     The packed producer copies each tensor into its reusable buffer, after which
     this generator frees the NPU copy before producing the next one.
 
-    Multimodal models expose their language model under a ``language_model.``
-    prefix on the vLLM side, so the name is mapped accordingly.
+    Fused MoE expert weights are expanded into the per-expert names vLLM's
+    FusedMoE loader expects (see ``_expand_fused_moe_experts``). Multimodal models
+    expose their language model under a ``language_model.`` prefix on the vLLM
+    side, so names are mapped accordingly.
 
     For a real TP/FSDP/Megatron trainer whose shards live on the NPU, replace the
     ``.to(device)`` below with an all-gather of the shards across your trainer's
     parallel group to reconstruct the full tensor here.
     """
-    for name, param in model.named_parameters():
+
+    def emit(name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor]:
         vllm_name = f"language_model.{name}" if is_multimodal else name
-        full = param.detach().to(device)
-        yield vllm_name, full
-        del full
+        return vllm_name, tensor.detach().to(device)
+
+    for name, param in model.named_parameters():
+        expanded = _expand_fused_moe_experts(name, param)
+        if expanded is not None:
+            for sub_name, sub_tensor in expanded:
+                out_name, out_tensor = emit(sub_name, sub_tensor)
+                yield out_name, out_tensor
+                del out_tensor
+        else:
+            out_name, out_tensor = emit(name, param)
+            yield out_name, out_tensor
+            del out_tensor
+
+
+def _expand_fused_moe_experts(name: str, param: torch.Tensor):
+    """Expand HF fused-expert tensors into per-expert (name, slice) pairs.
+
+    Recent transformers MoE models (e.g. Qwen3-MoE) store all experts of a layer
+    in a single fused tensor, which vLLM's FusedMoE loader does not understand:
+
+        ...mlp.experts.gate_up_proj  [num_experts, 2*intermediate, hidden]
+        ...mlp.experts.down_proj     [num_experts, hidden, intermediate]
+
+    vLLM instead expects per-expert checkpoint names, which its expert mapping
+    fuses back together:
+
+        ...mlp.experts.{e}.gate_proj.weight  [intermediate, hidden]
+        ...mlp.experts.{e}.up_proj.weight    [intermediate, hidden]
+        ...mlp.experts.{e}.down_proj.weight  [hidden, intermediate]
+
+    Returns a generator of per-expert pairs (CPU slices) for fused tensors, or
+    ``None`` for any other parameter (caller passes it through unchanged). Slices
+    are tiny, so streaming them keeps the NPU footprint bounded.
+    """
+    if name.endswith("mlp.experts.gate_up_proj"):
+        prefix = name[: -len("gate_up_proj")]  # ...mlp.experts.
+        half = param.shape[1] // 2  # gate rows [:half], up rows [half:]
+
+        def gen_gate_up():
+            for e in range(param.shape[0]):
+                yield f"{prefix}{e}.gate_proj.weight", param[e, :half, :]
+                yield f"{prefix}{e}.up_proj.weight", param[e, half:, :]
+
+        return gen_gate_up()
+
+    if name.endswith("mlp.experts.down_proj"):
+        prefix = name[: -len("down_proj")]
+
+        def gen_down():
+            for e in range(param.shape[0]):
+                yield f"{prefix}{e}.down_proj.weight", param[e]
+
+        return gen_down()
+
+    return None
 
 
 def main():
