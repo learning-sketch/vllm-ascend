@@ -86,12 +86,13 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 # Enable insecure serialization for IPC handle serialization over HTTP.
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-# The httpx client MUST be created AFTER torch.npu.set_device (CANN init):
-# a client constructed before set_device cannot open new connections to the
-# local server afterwards (connect hangs until timeout), whereas one created
-# after set_device works -- exactly like the OpenAI client below. ``main``
-# assigns this after pinning the device. ``trust_env=False`` ignores any
-# http_proxy/https_proxy so local calls go direct.
+# Shared httpx client, set in ``main``. After torch.npu.set_device (CANN init),
+# this process can no longer open *new* TCP connections to the local server from
+# a freshly created client (connect hangs until timeout) -- only the already
+# established, kept-alive connection works. So we create ONE httpx client, hand
+# it to the OpenAI client as its transport, and reuse that same client (and its
+# kept-alive connection) for every control-plane call and the /update_weights
+# POST. ``trust_env=False`` ignores any http_proxy/https_proxy.
 _HTTP: httpx.Client | None = None
 
 PROMPTS = [
@@ -118,25 +119,25 @@ def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list
 
 def init_weight_transfer_engine() -> None:
     """Initialize weight transfer via HTTP endpoint (no-op for NPU IPC)."""
-    _HTTP.post("/init_weight_transfer_engine", json={"init_info": {}}).raise_for_status()
+    _HTTP.post(f"{BASE_URL}/init_weight_transfer_engine", json={"init_info": {}}).raise_for_status()
 
 
 def start_weight_update(is_checkpoint_format: bool = True) -> None:
     """Prepare layerwise reload on the vLLM server (call before update_weights)."""
-    _HTTP.post("/start_weight_update", json={"is_checkpoint_format": is_checkpoint_format}).raise_for_status()
+    _HTTP.post(f"{BASE_URL}/start_weight_update", json={"is_checkpoint_format": is_checkpoint_format}).raise_for_status()
 
 
 def finish_weight_update() -> None:
     """Finalize layerwise reload on the vLLM server (call after update_weights)."""
-    _HTTP.post("/finish_weight_update").raise_for_status()
+    _HTTP.post(f"{BASE_URL}/finish_weight_update").raise_for_status()
 
 
 def pause_generation() -> None:
-    _HTTP.post("/pause").raise_for_status()
+    _HTTP.post(f"{BASE_URL}/pause").raise_for_status()
 
 
 def resume_generation() -> None:
-    _HTTP.post("/resume").raise_for_status()
+    _HTTP.post(f"{BASE_URL}/resume").raise_for_status()
 
 
 def send_update_via_httpx(update_info) -> None:
@@ -157,7 +158,7 @@ def send_update_via_httpx(update_info) -> None:
     if update_info.tensor_sizes is not None:
         fields["tensor_sizes"] = update_info.tensor_sizes
     fields["ipc_handles_pickled"] = base64.b64encode(pickle.dumps(update_info.ipc_handles)).decode("utf-8")
-    _HTTP.post("/update_weights", json={"update_info": fields}).raise_for_status()
+    _HTTP.post(f"{BASE_URL}/update_weights", json={"update_info": fields}).raise_for_status()
 
 
 def main():
@@ -169,10 +170,6 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     device = f"npu:{local_rank}"
     torch.npu.set_device(local_rank)
-
-    # Create the httpx client now, AFTER set_device (see the note at _HTTP).
-    global _HTTP
-    _HTTP = httpx.Client(base_url=BASE_URL, trust_env=False, timeout=300.0)
 
     # The trainer ranks form their own process group (independent of vLLM's
     # internal TP group) so trainer_send_weights can all-gather IPC handles.
@@ -193,7 +190,12 @@ def main():
     train_model.to(device)
     train_model.eval()
 
-    client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY")
+    # Create ONE httpx client and share it between the OpenAI client (transport)
+    # and our control-plane / weight-update calls, so everything reuses the same
+    # kept-alive connection (see the note at _HTTP).
+    global _HTTP
+    _HTTP = httpx.Client(trust_env=False, timeout=300.0)
+    client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY", http_client=_HTTP)
 
     if rank == 0:
         print("-" * 50)

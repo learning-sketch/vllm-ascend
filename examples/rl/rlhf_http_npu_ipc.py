@@ -66,10 +66,12 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 # Enable insecure serialization for IPC handle serialization over HTTP
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-# The httpx client MUST be created AFTER setting the NPU device (CANN init):
-# a client constructed before cannot open new connections to the local server
-# afterwards (connect hangs until timeout), whereas one created after works --
-# like the OpenAI client. ``main`` assigns this after pinning the device.
+# Shared httpx client, set in ``main``. After setting the NPU device (CANN init),
+# this process can no longer open *new* TCP connections to the local server from
+# a freshly created client (connect hangs until timeout) -- only the already
+# established, kept-alive connection works. So we create ONE httpx client, hand
+# it to the OpenAI client as its transport, and reuse that same client for every
+# control-plane call and the /update_weights POST.
 _HTTP: httpx.Client | None = None
 
 
@@ -89,7 +91,7 @@ def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list
 
 def init_weight_transfer_engine() -> None:
     """Initialize weight transfer via HTTP endpoint (no-op for NPU IPC)."""
-    _HTTP.post("/init_weight_transfer_engine", json={"init_info": {}}).raise_for_status()
+    _HTTP.post(f"{BASE_URL}/init_weight_transfer_engine", json={"init_info": {}}).raise_for_status()
 
 
 def start_weight_update(is_checkpoint_format: bool = True) -> None:
@@ -98,7 +100,7 @@ def start_weight_update(is_checkpoint_format: bool = True) -> None:
     Prepares the model for layerwise reload on the vLLM server side.
     Must be called before update_weights.
     """
-    _HTTP.post("/start_weight_update", json={"is_checkpoint_format": is_checkpoint_format}).raise_for_status()
+    _HTTP.post(f"{BASE_URL}/start_weight_update", json={"is_checkpoint_format": is_checkpoint_format}).raise_for_status()
 
 
 def finish_weight_update() -> None:
@@ -107,17 +109,17 @@ def finish_weight_update() -> None:
     Finalizes layerwise reload on the vLLM server side.
     Must be called after all update_weights calls are complete.
     """
-    _HTTP.post("/finish_weight_update").raise_for_status()
+    _HTTP.post(f"{BASE_URL}/finish_weight_update").raise_for_status()
 
 
 def pause_generation() -> None:
     """Pause generation via HTTP endpoint."""
-    _HTTP.post("/pause").raise_for_status()
+    _HTTP.post(f"{BASE_URL}/pause").raise_for_status()
 
 
 def resume_generation() -> None:
     """Resume generation via HTTP endpoint."""
-    _HTTP.post("/resume").raise_for_status()
+    _HTTP.post(f"{BASE_URL}/resume").raise_for_status()
 
 
 def send_update_via_httpx(update_info) -> None:
@@ -125,7 +127,7 @@ def send_update_via_httpx(update_info) -> None:
 
     Mirrors the engine's built-in ``send_mode="http"`` path but uses httpx
     instead of requests (see the module-level note on why requests breaks after
-    ``torch.npu.set_device``).
+    setting the NPU device).
     """
     fields = {
         "names": update_info.names,
@@ -136,7 +138,7 @@ def send_update_via_httpx(update_info) -> None:
     if update_info.tensor_sizes is not None:
         fields["tensor_sizes"] = update_info.tensor_sizes
     fields["ipc_handles_pickled"] = base64.b64encode(pickle.dumps(update_info.ipc_handles)).decode("utf-8")
-    _HTTP.post("/update_weights", json={"update_info": fields}).raise_for_status()
+    _HTTP.post(f"{BASE_URL}/update_weights", json={"update_info": fields}).raise_for_status()
 
 
 def main():
@@ -144,10 +146,6 @@ def main():
     # The server should be started on NPU 0 with reduced memory utilization.
     device = "npu:0"
     torch.accelerator.set_device_index(device)
-
-    # Create the httpx client now, AFTER setting the device (see the note at _HTTP).
-    global _HTTP
-    _HTTP = httpx.Client(base_url=BASE_URL, trust_env=False, timeout=300.0)
 
     # Load the training model on the same NPU as the server.
     # Use bfloat16 to reduce memory footprint.
@@ -160,10 +158,15 @@ def main():
     train_model.to(device)
     train_model.eval()
 
-    # Create OpenAI client pointing to the vLLM server
+    # Create ONE httpx client and share it between the OpenAI client (transport)
+    # and our control-plane / weight-update calls, so everything reuses the same
+    # kept-alive connection (see the note at _HTTP).
+    global _HTTP
+    _HTTP = httpx.Client(trust_env=False, timeout=300.0)
     client = OpenAI(
         base_url=f"{BASE_URL}/v1",
         api_key="EMPTY",
+        http_client=_HTTP,
     )
 
     # Test prompts
