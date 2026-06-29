@@ -63,6 +63,8 @@ from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
 # Override with e.g. MODEL_NAME=/path/to/model ; must match the served model.
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-0.6B")
+# USE_CHAT=1 -> /v1/chat/completions (applies the chat template); else /v1/completions.
+USE_CHAT = os.environ.get("USE_CHAT", "0") == "1"
 
 # Enable insecure serialization for IPC handle serialization over HTTP
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -76,16 +78,20 @@ _HTTP: httpx.Client | None = None
 
 
 def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list[str]:
-    """Generate completions using the OpenAI-compatible API."""
+    """Generate via /v1/chat/completions when USE_CHAT, else /v1/completions."""
     results = []
     for prompt in prompts:
-        response = client.completions.create(
-            model=model,
-            prompt=prompt,
-            max_tokens=32,
-            temperature=0,
-        )
-        results.append(response.choices[0].text)
+        if USE_CHAT:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=32,
+                temperature=0,
+            )
+            results.append(response.choices[0].message.content)
+        else:
+            response = client.completions.create(model=model, prompt=prompt, max_tokens=32, temperature=0)
+            results.append(response.choices[0].text)
     return results
 
 
