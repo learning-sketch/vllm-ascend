@@ -44,7 +44,7 @@ import pickle
 import httpx
 import torch
 from openai import OpenAI
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
     NPUIPCTrainerSendWeightsArgs,
@@ -122,6 +122,20 @@ def resume_generation() -> None:
     _HTTP.post(f"{BASE_URL}/resume").raise_for_status()
 
 
+def is_multimodal_model(model_name: str) -> bool:
+    """True if the HF config exposes a ``vision_config`` (multimodal model)."""
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    return hasattr(config, "vision_config")
+
+
+def mapped_named_params(model: torch.nn.Module, is_multimodal: bool):
+    """Yield (vllm_name, param). Multimodal models expose their language model
+    under a ``language_model.`` prefix on the vLLM side."""
+    for name, param in model.named_parameters():
+        vllm_name = f"language_model.{name}" if is_multimodal else name
+        yield vllm_name, param
+
+
 def send_update_via_httpx(update_info) -> None:
     """Custom ``send_mode`` callable: POST ``/update_weights`` via httpx.
 
@@ -157,6 +171,7 @@ def main():
     train_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16)
     train_model.to(device)
     train_model.eval()
+    is_multimodal = is_multimodal_model(MODEL_NAME)
 
     client = OpenAI(
         base_url=f"{BASE_URL}/v1",
@@ -202,7 +217,7 @@ def main():
     print("Broadcasting weights via NPU IPC (HTTP)...")
     trainer_args = NPUIPCTrainerSendWeightsArgs(send_mode=send_update_via_httpx, url=BASE_URL)
     NPUIPCWeightTransferEngine.trainer_send_weights(
-        iterator=train_model.named_parameters(),
+        iterator=mapped_named_params(train_model, is_multimodal),
         trainer_args=trainer_args,
     )
 

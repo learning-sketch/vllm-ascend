@@ -49,7 +49,7 @@ import threading
 import httpx
 import torch
 from openai import OpenAI
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 from vllm.utils.network_utils import get_ip, get_open_port
 
 from vllm_ascend.distributed.weight_transfer.hccl_engine import (
@@ -63,6 +63,12 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 # Shared httpx client, set in ``main`` to the OpenAI client's OWN transport
 # (``client._client``); see the module docstring on why this is required.
 _HTTP: httpx.Client | None = None
+
+
+def is_multimodal_model(model_name: str) -> bool:
+    """True if the HF config exposes a ``vision_config`` (multimodal model)."""
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    return hasattr(config, "vision_config")
 
 
 def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list[str]:
@@ -157,6 +163,9 @@ def main():
     train_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16)
     train_model.to(device)
     train_model.eval()
+    # Multimodal models expose their language model under a ``language_model.``
+    # prefix on the vLLM side; map the trainer param names accordingly.
+    is_multimodal = is_multimodal_model(MODEL_NAME)
 
     prompts = [
         "Hello, my name is",
@@ -202,7 +211,7 @@ def main():
     shapes: list[list[int]] = []
     max_tensor_bytes = 0
     for name, p in train_model.named_parameters():
-        names.append(name)
+        names.append(f"language_model.{name}" if is_multimodal else name)
         dtype_names.append(str(p.dtype).split(".")[-1])
         shapes.append(list(p.shape))
         max_tensor_bytes = max(max_tensor_bytes, p.numel() * p.element_size())

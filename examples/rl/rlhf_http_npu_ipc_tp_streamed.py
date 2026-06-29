@@ -52,7 +52,7 @@ import httpx
 import torch
 import torch.distributed as dist
 from openai import OpenAI
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
     NPUIPCTrainerSendWeightsArgs,
@@ -119,7 +119,15 @@ def send_update_via_httpx(update_info) -> None:
     _HTTP.post(f"{BASE_URL}/update_weights", json={"update_info": fields}).raise_for_status()
 
 
-def _streamed_full_param_iter(model: torch.nn.Module, device: str) -> Iterator[tuple[str, torch.Tensor]]:
+def is_multimodal_model(model_name: str) -> bool:
+    """True if the HF config exposes a ``vision_config`` (multimodal model)."""
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    return hasattr(config, "vision_config")
+
+
+def _streamed_full_param_iter(
+    model: torch.nn.Module, device: str, is_multimodal: bool
+) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield full parameters one at a time, materialized on the NPU just-in-time.
 
     The model stays on CPU, so the FULL model is never resident on the NPU --
@@ -127,13 +135,17 @@ def _streamed_full_param_iter(model: torch.nn.Module, device: str) -> Iterator[t
     The packed producer copies each tensor into its reusable buffer, after which
     this generator frees the NPU copy before producing the next one.
 
+    Multimodal models expose their language model under a ``language_model.``
+    prefix on the vLLM side, so the name is mapped accordingly.
+
     For a real TP/FSDP/Megatron trainer whose shards live on the NPU, replace the
     ``.to(device)`` below with an all-gather of the shards across your trainer's
     parallel group to reconstruct the full tensor here.
     """
     for name, param in model.named_parameters():
+        vllm_name = f"language_model.{name}" if is_multimodal else name
         full = param.detach().to(device)
-        yield name, full
+        yield vllm_name, full
         del full
 
 
@@ -154,6 +166,7 @@ def main():
         print(f"Loading training model on CPU (streamed to NPU per-param): {MODEL_NAME}")
     train_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16)
     train_model.eval()
+    is_multimodal = is_multimodal_model(MODEL_NAME)
 
     client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY")
     global _HTTP
@@ -191,7 +204,7 @@ def main():
         packed_buffer_size_bytes=packed_buffer_size_bytes,
     )
     NPUIPCWeightTransferEngine.trainer_send_weights(
-        iterator=_streamed_full_param_iter(train_model, device),
+        iterator=_streamed_full_param_iter(train_model, device, is_multimodal),
         trainer_args=trainer_args,
     )
 
