@@ -66,8 +66,11 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 # Enable insecure serialization for IPC handle serialization over HTTP
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-# ``trust_env=False`` ignores any http_proxy/https_proxy so local calls go direct.
-_HTTP = httpx.Client(base_url=BASE_URL, trust_env=False, timeout=300.0)
+# The httpx client MUST be created AFTER setting the NPU device (CANN init):
+# a client constructed before cannot open new connections to the local server
+# afterwards (connect hangs until timeout), whereas one created after works --
+# like the OpenAI client. ``main`` assigns this after pinning the device.
+_HTTP: httpx.Client | None = None
 
 
 def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list[str]:
@@ -141,6 +144,10 @@ def main():
     # The server should be started on NPU 0 with reduced memory utilization.
     device = "npu:0"
     torch.accelerator.set_device_index(device)
+
+    # Create the httpx client now, AFTER setting the device (see the note at _HTTP).
+    global _HTTP
+    _HTTP = httpx.Client(base_url=BASE_URL, trust_env=False, timeout=300.0)
 
     # Load the training model on the same NPU as the server.
     # Use bfloat16 to reduce memory footprint.

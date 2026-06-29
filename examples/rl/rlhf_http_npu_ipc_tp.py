@@ -86,8 +86,13 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 # Enable insecure serialization for IPC handle serialization over HTTP.
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-# ``trust_env=False`` ignores any http_proxy/https_proxy so local calls go direct.
-_HTTP = httpx.Client(base_url=BASE_URL, trust_env=False, timeout=300.0)
+# The httpx client MUST be created AFTER torch.npu.set_device (CANN init):
+# a client constructed before set_device cannot open new connections to the
+# local server afterwards (connect hangs until timeout), whereas one created
+# after set_device works -- exactly like the OpenAI client below. ``main``
+# assigns this after pinning the device. ``trust_env=False`` ignores any
+# http_proxy/https_proxy so local calls go direct.
+_HTTP: httpx.Client | None = None
 
 PROMPTS = [
     "Hello, my name is",
@@ -164,6 +169,10 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     device = f"npu:{local_rank}"
     torch.npu.set_device(local_rank)
+
+    # Create the httpx client now, AFTER set_device (see the note at _HTTP).
+    global _HTTP
+    _HTTP = httpx.Client(base_url=BASE_URL, trust_env=False, timeout=300.0)
 
     # The trainer ranks form their own process group (independent of vLLM's
     # internal TP group) so trainer_send_weights can all-gather IPC handles.
