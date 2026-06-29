@@ -36,12 +36,12 @@ The example generates text before and after the weight update to show the
 server switching from dummy weights to the broadcast weights.
 
 Note on HTTP transport:
-    All trainer -> server HTTP reuses the OpenAI SDK's own httpx client
-    (``client._client``). After setting the NPU device (CANN init) this process
-    can no longer open new TCP connections to the local server from a hand-built
-    httpx/requests client (connect hangs until timeout); only the OpenAI client's
-    transport connects. ``get_world_size`` is the one call made BEFORE the device
-    is set, so it uses a plain request.
+    After setting the NPU device (CANN init) this process can no longer open new
+    TCP connections to the local server from an HTTP client that was constructed
+    AFTER set_device (connect hangs until timeout). So we construct the OpenAI
+    client BEFORE set_device and reuse its httpx transport (``client._client``)
+    for every control-plane / weight-update call. ``get_world_size`` runs before
+    set_device too, so it uses a plain request.
 """
 
 import threading
@@ -139,6 +139,15 @@ def main():
     inference_world_size = get_world_size(BASE_URL)
     world_size = inference_world_size + 1  # +1 for the trainer (HCCL rank 0)
 
+    # Create the OpenAI client BEFORE set_device and reuse its httpx transport for
+    # every control-plane / weight-update call. This ordering is REQUIRED: a
+    # client constructed AFTER the NPU device is set cannot open connections to
+    # the local server afterwards (connect hangs until timeout), whereas one
+    # constructed before connects fine even when the first request is sent later.
+    client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY")
+    global _HTTP
+    _HTTP = client._client
+
     # The trainer owns the chip just past the inference chips (0..N-1 are workers,
     # so the trainer uses chip N). This needs N + 1 NPUs total.
     device = f"npu:{inference_world_size}"
@@ -148,12 +157,6 @@ def main():
     train_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16)
     train_model.to(device)
     train_model.eval()
-
-    # Create the OpenAI client AFTER set_device and reuse its httpx transport for
-    # every control-plane / weight-update call (see the module docstring).
-    client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY")
-    global _HTTP
-    _HTTP = client._client
 
     prompts = [
         "Hello, my name is",
