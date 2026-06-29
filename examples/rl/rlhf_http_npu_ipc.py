@@ -32,6 +32,9 @@ The example performs the following steps:
   the vLLM server using NPU IPC handles (via HTTP). The pause/resume is
   handled by ``trainer_send_weights`` — it calls ``update_weights`` internally.
 * Generate text again to show normal output after the weight update.
+
+For the tensor-parallel (TP > 1) workflow, see
+``examples/rl/rlhf_http_npu_ipc_tp.py``.
 """
 
 import os
