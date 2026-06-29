@@ -44,6 +44,7 @@ Note on HTTP transport:
     set_device too, so it uses a plain request.
 """
 
+import os
 import threading
 
 import httpx
@@ -57,8 +58,9 @@ from vllm_ascend.distributed.weight_transfer.hccl_engine import (
     HCCLWeightTransferEngine,
 )
 
-BASE_URL = "http://127.0.0.1:8000"
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
+# Override with e.g. MODEL_NAME=/path/to/model ; must match the served model.
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-0.6B")
 
 # Shared httpx client, created in ``main`` BEFORE set_device and used as the
 # OpenAI transport; see the module docstring on why this ordering is required.

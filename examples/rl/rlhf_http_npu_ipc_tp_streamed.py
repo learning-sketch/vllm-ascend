@@ -59,8 +59,10 @@ from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
     NPUIPCWeightTransferEngine,
 )
 
-BASE_URL = "http://127.0.0.1:8000"
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
+# Override with e.g. MODEL_NAME=/mnt/weights/Qwen3-30B-A3B/ ; must match the
+# model the vLLM server was started with.
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-0.6B")
 
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 

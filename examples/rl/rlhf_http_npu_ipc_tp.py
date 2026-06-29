@@ -80,8 +80,9 @@ from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
 # engine would otherwise make with ``requests`` (we pass a custom ``send_mode``
 # callable for that). Use 127.0.0.1 (IPv4) to also avoid any localhost->::1
 # resolution stalls when the server only listens on IPv4.
-BASE_URL = "http://127.0.0.1:8000"
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
+# Override with e.g. MODEL_NAME=/path/to/model ; must match the served model.
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-0.6B")
 
 # Enable insecure serialization for IPC handle serialization over HTTP.
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
