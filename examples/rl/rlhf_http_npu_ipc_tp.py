@@ -73,6 +73,33 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 # Enable insecure serialization for IPC handle serialization over HTTP.
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+
+def _bypass_proxy_for_localhost() -> None:
+    """Ensure local hosts are excluded from any configured HTTP proxy.
+
+    The vLLM server is local. If http_proxy/https_proxy is set in the
+    environment, ``requests`` (used both here and inside ``trainer_send_weights``
+    for the ``/update_weights`` POST) would route localhost through the proxy and
+    time out on connect. Append the local hosts to no_proxy so every requests
+    call -- including the engine's internal POST -- connects directly.
+    """
+    local_hosts = ["localhost", "127.0.0.1", "::1"]
+    for var in ("no_proxy", "NO_PROXY"):
+        current = os.environ.get(var, "")
+        entries = [e.strip() for e in current.split(",") if e.strip()]
+        for host in local_hosts:
+            if host not in entries:
+                entries.append(host)
+        os.environ[var] = ",".join(entries)
+
+
+_bypass_proxy_for_localhost()
+
+# Belt-and-suspenders: this session ignores proxy env entirely for the
+# control-plane calls below regardless of how no_proxy is configured.
+_SESSION = requests.Session()
+_SESSION.trust_env = False
+
 PROMPTS = [
     "Hello, my name is",
     "The president of the United States is",
@@ -97,13 +124,13 @@ def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list
 
 def init_weight_transfer_engine(base_url: str) -> None:
     """Initialize weight transfer via HTTP endpoint (no-op for NPU IPC)."""
-    response = requests.post(f"{base_url}/init_weight_transfer_engine", json={"init_info": {}}, timeout=60)
+    response = _SESSION.post(f"{base_url}/init_weight_transfer_engine", json={"init_info": {}}, timeout=60)
     response.raise_for_status()
 
 
 def start_weight_update(base_url: str, is_checkpoint_format: bool = True) -> None:
     """Prepare layerwise reload on the vLLM server (call before update_weights)."""
-    response = requests.post(
+    response = _SESSION.post(
         f"{base_url}/start_weight_update",
         json={"is_checkpoint_format": is_checkpoint_format},
         timeout=60,
@@ -113,17 +140,17 @@ def start_weight_update(base_url: str, is_checkpoint_format: bool = True) -> Non
 
 def finish_weight_update(base_url: str) -> None:
     """Finalize layerwise reload on the vLLM server (call after update_weights)."""
-    response = requests.post(f"{base_url}/finish_weight_update", timeout=60)
+    response = _SESSION.post(f"{base_url}/finish_weight_update", timeout=60)
     response.raise_for_status()
 
 
 def pause_generation(base_url: str) -> None:
-    response = requests.post(f"{base_url}/pause", timeout=60)
+    response = _SESSION.post(f"{base_url}/pause", timeout=60)
     response.raise_for_status()
 
 
 def resume_generation(base_url: str) -> None:
-    response = requests.post(f"{base_url}/resume", timeout=60)
+    response = _SESSION.post(f"{base_url}/resume", timeout=60)
     response.raise_for_status()
 
 
