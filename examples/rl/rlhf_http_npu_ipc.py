@@ -66,12 +66,12 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 # Enable insecure serialization for IPC handle serialization over HTTP
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-# Shared httpx client, set in ``main``. After setting the NPU device (CANN init),
-# this process can no longer open *new* TCP connections to the local server from
-# a freshly created client (connect hangs until timeout) -- only the already
-# established, kept-alive connection works. So we create ONE httpx client, hand
-# it to the OpenAI client as its transport, and reuse that same client for every
-# control-plane call and the /update_weights POST.
+# Shared httpx client, set in ``main`` to the OpenAI client's OWN transport
+# (``client._client``). After setting the NPU device (CANN init) this process can
+# no longer connect to the local server from a hand-built httpx/requests client
+# (connect hangs until timeout), but the OpenAI SDK's internally-created client
+# does connect. So we reuse that exact, working client for every control-plane
+# call and the /update_weights POST instead of constructing our own.
 _HTTP: httpx.Client | None = None
 
 
@@ -158,16 +158,15 @@ def main():
     train_model.to(device)
     train_model.eval()
 
-    # Create ONE httpx client and share it between the OpenAI client (transport)
-    # and our control-plane / weight-update calls, so everything reuses the same
-    # kept-alive connection (see the note at _HTTP).
-    global _HTTP
-    _HTTP = httpx.Client(trust_env=False, timeout=300.0)
     client = OpenAI(
         base_url=f"{BASE_URL}/v1",
         api_key="EMPTY",
-        http_client=_HTTP,
     )
+    # Reuse the OpenAI client's own httpx transport for our control-plane and
+    # weight-update calls -- it is the client that actually connects to the
+    # server after set_device (see the note at _HTTP).
+    global _HTTP
+    _HTTP = client._client
 
     # Test prompts
     prompts = [
