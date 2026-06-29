@@ -68,8 +68,16 @@ os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 # packed IPC buffer. The buffer must be at least as large as the biggest tensor.
 PACKED_BUFFER_HEADROOM_BYTES = 128 * 2**20  # 128 MiB
 
-# Shared httpx client, set in ``main`` to the OpenAI client's OWN transport; see
-# rlhf_http_npu_ipc_tp.py for why a hand-built client cannot connect post-set_device.
+# Shared httpx client, created in ``main`` BEFORE torch.npu.set_device.
+#
+# Two facts force this design:
+#   1. A client constructed AFTER set_device (CANN init) cannot open new TCP
+#      connections to the local server (connect hangs until timeout); a client
+#      constructed BEFORE can, even for connections opened later.
+#   2. During the (potentially long) per-parameter gather, the kept-alive
+#      connection goes idle and is dropped by the server's keep-alive timeout, so
+#      the next POST must be able to RECONNECT -- which only the before-set_device
+#      client can do. ``keepalive_expiry`` is raised to prefer reuse anyway.
 _HTTP: httpx.Client | None = None
 
 
@@ -154,6 +162,13 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     device = f"npu:{local_rank}"
+
+    # Create the HTTP/OpenAI client BEFORE set_device (see the note at _HTTP), and
+    # use it as the OpenAI transport so generation and control-plane share it.
+    global _HTTP
+    _HTTP = httpx.Client(trust_env=False, timeout=300.0, limits=httpx.Limits(keepalive_expiry=600.0))
+    client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY", http_client=_HTTP)
+
     torch.npu.set_device(local_rank)
 
     # gloo group (CPU/TCP) so the packed path can all-gather/merge IPC handles
@@ -167,10 +182,6 @@ def main():
     train_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16)
     train_model.eval()
     is_multimodal = is_multimodal_model(MODEL_NAME)
-
-    client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY")
-    global _HTTP
-    _HTTP = client._client
 
     # Size the packed buffer to fit the largest single (full) parameter, with
     # headroom. The buffer is the dominant bounded NPU cost of the transfer.

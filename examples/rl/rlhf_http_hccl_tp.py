@@ -60,8 +60,8 @@ from vllm_ascend.distributed.weight_transfer.hccl_engine import (
 BASE_URL = "http://127.0.0.1:8000"
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
-# Shared httpx client, set in ``main`` to the OpenAI client's OWN transport
-# (``client._client``); see the module docstring on why this is required.
+# Shared httpx client, created in ``main`` BEFORE set_device and used as the
+# OpenAI transport; see the module docstring on why this ordering is required.
 _HTTP: httpx.Client | None = None
 
 
@@ -150,9 +150,9 @@ def main():
     # client constructed AFTER the NPU device is set cannot open connections to
     # the local server afterwards (connect hangs until timeout), whereas one
     # constructed before connects fine even when the first request is sent later.
-    client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY")
     global _HTTP
-    _HTTP = client._client
+    _HTTP = httpx.Client(trust_env=False, timeout=300.0, limits=httpx.Limits(keepalive_expiry=600.0))
+    client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY", http_client=_HTTP)
 
     # The trainer owns the chip just past the inference chips (0..N-1 are workers,
     # so the trainer uses chip N). This needs N + 1 NPUs total.
