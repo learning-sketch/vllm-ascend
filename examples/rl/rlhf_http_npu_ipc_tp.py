@@ -42,6 +42,16 @@ Prerequisites:
 
 The script generates text before and after the weight update (rank 0 only) to
 show the server switching from dummy weights to the broadcast weights.
+
+Note on the trainer process group backend:
+    The trainer group uses the ``gloo`` (CPU/TCP) backend, not ``hccl``. It only
+    needs to all-gather the CPU-side IPC handles and barrier; the weight data
+    itself moves via IPC shared memory. Because the vLLM server already holds an
+    HCCL communicator on these same physical chips, starting a second ``hccl``
+    group here would collide on the NPU socket port and fail with
+    ``HCCL function error ... code is 7`` / ``EI0020 ... port already bound``.
+    (If you must use ``hccl`` for some reason, give the trainer a non-overlapping
+    ``HCCL_NPU_SOCKET_PORT_RANGE`` instead.)
 """
 
 import os
@@ -129,7 +139,14 @@ def main():
 
     # The trainer ranks form their own process group (independent of vLLM's
     # internal TP group) so trainer_send_weights can all-gather IPC handles.
-    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    #
+    # Use the gloo (CPU/TCP) backend, NOT hccl: this group only all-gathers the
+    # (CPU-side) IPC handle metadata and barriers — the actual weight data moves
+    # via IPC shared memory, not through this group. The vLLM server already
+    # holds an HCCL communicator on these same physical chips, so creating a
+    # second hccl group here collides on the NPU socket port and fails with
+    # "HCCL function error ... code is 7" / EI0020 (port already bound).
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
 
     # Each rank loads a full (replicated) copy of the model. bfloat16 keeps the
     # footprint small enough to share the chip with the vLLM worker.
