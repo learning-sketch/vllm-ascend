@@ -49,7 +49,9 @@ from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
     NPUIPCWeightTransferEngine,
 )
 
-BASE_URL = "http://localhost:8000"
+# Use 127.0.0.1 (IPv4) rather than "localhost" to avoid requests hanging on an
+# IPv6 (::1) connect when the vLLM server only listens on IPv4.
+BASE_URL = "http://127.0.0.1:8000"
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 # Enable insecure serialization for IPC handle serialization over HTTP

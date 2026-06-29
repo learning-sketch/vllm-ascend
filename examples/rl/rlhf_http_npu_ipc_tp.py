@@ -67,7 +67,12 @@ from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
     NPUIPCWeightTransferEngine,
 )
 
-BASE_URL = "http://localhost:8000"
+# Use 127.0.0.1 (IPv4) rather than "localhost": when localhost resolves to the
+# IPv6 ::1 first and the vLLM server only listens on IPv4 (0.0.0.0), requests
+# hangs on the ::1 SYN until the connect timeout instead of falling back to
+# IPv4 (the httpx-based OpenAI client may pick IPv4 and appear to work). This
+# url is also what trainer_send_weights uses for its /update_weights POST.
+BASE_URL = "http://127.0.0.1:8000"
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 # Enable insecure serialization for IPC handle serialization over HTTP.
