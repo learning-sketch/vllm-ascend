@@ -54,9 +54,11 @@ Note on the trainer process group backend:
     ``HCCL_NPU_SOCKET_PORT_RANGE`` instead.)
 """
 
+import base64
 import os
+import pickle
 
-import requests
+import httpx
 import torch
 import torch.distributed as dist
 from openai import OpenAI
@@ -67,43 +69,25 @@ from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
     NPUIPCWeightTransferEngine,
 )
 
-# Use 127.0.0.1 (IPv4) rather than "localhost": when localhost resolves to the
-# IPv6 ::1 first and the vLLM server only listens on IPv4 (0.0.0.0), requests
-# hangs on the ::1 SYN until the connect timeout instead of falling back to
-# IPv4 (the httpx-based OpenAI client may pick IPv4 and appear to work). This
-# url is also what trainer_send_weights uses for its /update_weights POST.
+# IMPORTANT: use httpx, not requests, for all trainer -> server HTTP.
+#
+# After ``torch.npu.set_device`` (CANN/torch_npu init), ``requests``/urllib3 can
+# no longer open NEW TCP connections to the local server -- ``connect`` hangs
+# until timeout -- even though a raw ``socket.create_connection`` (and httpx,
+# which uses it under the hood) connects instantly. urllib3 ships its own
+# ``create_connection`` implementation that breaks in this environment, so we
+# route every call through httpx, including the ``/update_weights`` POST that the
+# engine would otherwise make with ``requests`` (we pass a custom ``send_mode``
+# callable for that). Use 127.0.0.1 (IPv4) to also avoid any localhost->::1
+# resolution stalls when the server only listens on IPv4.
 BASE_URL = "http://127.0.0.1:8000"
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 # Enable insecure serialization for IPC handle serialization over HTTP.
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-
-def _bypass_proxy_for_localhost() -> None:
-    """Ensure local hosts are excluded from any configured HTTP proxy.
-
-    The vLLM server is local. If http_proxy/https_proxy is set in the
-    environment, ``requests`` (used both here and inside ``trainer_send_weights``
-    for the ``/update_weights`` POST) would route localhost through the proxy and
-    time out on connect. Append the local hosts to no_proxy so every requests
-    call -- including the engine's internal POST -- connects directly.
-    """
-    local_hosts = ["localhost", "127.0.0.1", "::1"]
-    for var in ("no_proxy", "NO_PROXY"):
-        current = os.environ.get(var, "")
-        entries = [e.strip() for e in current.split(",") if e.strip()]
-        for host in local_hosts:
-            if host not in entries:
-                entries.append(host)
-        os.environ[var] = ",".join(entries)
-
-
-_bypass_proxy_for_localhost()
-
-# Belt-and-suspenders: this session ignores proxy env entirely for the
-# control-plane calls below regardless of how no_proxy is configured.
-_SESSION = requests.Session()
-_SESSION.trust_env = False
+# ``trust_env=False`` ignores any http_proxy/https_proxy so local calls go direct.
+_HTTP = httpx.Client(base_url=BASE_URL, trust_env=False, timeout=300.0)
 
 PROMPTS = [
     "Hello, my name is",
@@ -127,36 +111,48 @@ def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list
     return results
 
 
-def init_weight_transfer_engine(base_url: str) -> None:
+def init_weight_transfer_engine() -> None:
     """Initialize weight transfer via HTTP endpoint (no-op for NPU IPC)."""
-    response = _SESSION.post(f"{base_url}/init_weight_transfer_engine", json={"init_info": {}}, timeout=60)
-    response.raise_for_status()
+    _HTTP.post("/init_weight_transfer_engine", json={"init_info": {}}).raise_for_status()
 
 
-def start_weight_update(base_url: str, is_checkpoint_format: bool = True) -> None:
+def start_weight_update(is_checkpoint_format: bool = True) -> None:
     """Prepare layerwise reload on the vLLM server (call before update_weights)."""
-    response = _SESSION.post(
-        f"{base_url}/start_weight_update",
-        json={"is_checkpoint_format": is_checkpoint_format},
-        timeout=60,
-    )
-    response.raise_for_status()
+    _HTTP.post("/start_weight_update", json={"is_checkpoint_format": is_checkpoint_format}).raise_for_status()
 
 
-def finish_weight_update(base_url: str) -> None:
+def finish_weight_update() -> None:
     """Finalize layerwise reload on the vLLM server (call after update_weights)."""
-    response = _SESSION.post(f"{base_url}/finish_weight_update", timeout=60)
-    response.raise_for_status()
+    _HTTP.post("/finish_weight_update").raise_for_status()
 
 
-def pause_generation(base_url: str) -> None:
-    response = _SESSION.post(f"{base_url}/pause", timeout=60)
-    response.raise_for_status()
+def pause_generation() -> None:
+    _HTTP.post("/pause").raise_for_status()
 
 
-def resume_generation(base_url: str) -> None:
-    response = _SESSION.post(f"{base_url}/resume", timeout=60)
-    response.raise_for_status()
+def resume_generation() -> None:
+    _HTTP.post("/resume").raise_for_status()
+
+
+def send_update_via_httpx(update_info) -> None:
+    """Custom ``send_mode`` callable: POST ``/update_weights`` via httpx.
+
+    Mirrors the engine's built-in ``send_mode="http"`` path, but uses httpx
+    instead of requests (see the module docstring on why requests breaks after
+    ``torch.npu.set_device``). The IPC handles are pickled + base64-encoded under
+    ``ipc_handles_pickled``; the server deserializes them with
+    ``VLLM_ALLOW_INSECURE_SERIALIZATION=1``.
+    """
+    fields = {
+        "names": update_info.names,
+        "dtype_names": update_info.dtype_names,
+        "shapes": update_info.shapes,
+        "packed": update_info.packed,
+    }
+    if update_info.tensor_sizes is not None:
+        fields["tensor_sizes"] = update_info.tensor_sizes
+    fields["ipc_handles_pickled"] = base64.b64encode(pickle.dumps(update_info.ipc_handles)).decode("utf-8")
+    _HTTP.post("/update_weights", json={"update_info": fields}).raise_for_status()
 
 
 def main():
@@ -199,18 +195,20 @@ def main():
             print("-" * 50)
 
         # Control-plane calls are driven by rank 0 only.
-        init_weight_transfer_engine(BASE_URL)
-        pause_generation(BASE_URL)
-        start_weight_update(BASE_URL)
+        init_weight_transfer_engine()
+        pause_generation()
+        start_weight_update()
 
     # Barrier so start_weight_update completes before any rank POSTs weights.
     dist.barrier()
 
     # All ranks participate: handles are all-gathered/merged across ranks, then
-    # rank 0 POSTs the merged payload to /update_weights.
+    # rank 0 POSTs the merged payload to /update_weights. We pass a custom
+    # ``send_mode`` callable (httpx) instead of "http" so the POST does not go
+    # through requests, which breaks after torch.npu.set_device.
     if rank == 0:
         print("Broadcasting weights via NPU IPC (HTTP, TP)...")
-    trainer_args = NPUIPCTrainerSendWeightsArgs(send_mode="http", url=BASE_URL)
+    trainer_args = NPUIPCTrainerSendWeightsArgs(send_mode=send_update_via_httpx, url=BASE_URL)
     NPUIPCWeightTransferEngine.trainer_send_weights(
         iterator=train_model.named_parameters(),
         trainer_args=trainer_args,
@@ -219,8 +217,8 @@ def main():
     dist.barrier()
 
     if rank == 0:
-        finish_weight_update(BASE_URL)
-        resume_generation(BASE_URL)
+        finish_weight_update()
+        resume_generation()
 
         print("-" * 50)
         print("Generating text AFTER weight update:")

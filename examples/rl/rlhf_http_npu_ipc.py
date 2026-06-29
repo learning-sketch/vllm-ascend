@@ -37,9 +37,11 @@ For the tensor-parallel (TP > 1) workflow, see
 ``examples/rl/rlhf_http_npu_ipc_tp.py``.
 """
 
+import base64
 import os
+import pickle
 
-import requests
+import httpx
 import torch
 from openai import OpenAI
 from transformers import AutoModelForCausalLM
@@ -49,13 +51,23 @@ from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
     NPUIPCWeightTransferEngine,
 )
 
-# Use 127.0.0.1 (IPv4) rather than "localhost" to avoid requests hanging on an
-# IPv6 (::1) connect when the vLLM server only listens on IPv4.
+# IMPORTANT: use httpx, not requests, for all trainer -> server HTTP.
+#
+# After ``torch.npu.set_device`` (CANN/torch_npu init), ``requests``/urllib3 can
+# no longer open NEW TCP connections to the local server -- ``connect`` hangs
+# until timeout -- even though a raw ``socket.create_connection`` (and httpx,
+# which uses it under the hood) connects instantly. So we route every call
+# through httpx, including the ``/update_weights`` POST that the engine would
+# otherwise make with ``requests`` (we pass a custom ``send_mode`` callable for
+# that). 127.0.0.1 (IPv4) also avoids any localhost->::1 resolution stalls.
 BASE_URL = "http://127.0.0.1:8000"
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 # Enable insecure serialization for IPC handle serialization over HTTP
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+# ``trust_env=False`` ignores any http_proxy/https_proxy so local calls go direct.
+_HTTP = httpx.Client(base_url=BASE_URL, trust_env=False, timeout=300.0)
 
 
 def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list[str]:
@@ -72,49 +84,56 @@ def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list
     return results
 
 
-def init_weight_transfer_engine(base_url: str) -> None:
+def init_weight_transfer_engine() -> None:
     """Initialize weight transfer via HTTP endpoint (no-op for NPU IPC)."""
-    url = f"{base_url}/init_weight_transfer_engine"
-    payload: dict[str, dict] = {"init_info": {}}
-    response = requests.post(url, json=payload, timeout=60)
-    response.raise_for_status()
+    _HTTP.post("/init_weight_transfer_engine", json={"init_info": {}}).raise_for_status()
 
 
-def start_weight_update(base_url: str, is_checkpoint_format: bool = True) -> None:
+def start_weight_update(is_checkpoint_format: bool = True) -> None:
     """Start weight update via HTTP endpoint.
 
     Prepares the model for layerwise reload on the vLLM server side.
     Must be called before update_weights.
     """
-    url = f"{base_url}/start_weight_update"
-    payload = {"is_checkpoint_format": is_checkpoint_format}
-    response = requests.post(url, json=payload, timeout=60)
-    response.raise_for_status()
+    _HTTP.post("/start_weight_update", json={"is_checkpoint_format": is_checkpoint_format}).raise_for_status()
 
 
-def finish_weight_update(base_url: str) -> None:
+def finish_weight_update() -> None:
     """Finish weight update via HTTP endpoint.
 
     Finalizes layerwise reload on the vLLM server side.
     Must be called after all update_weights calls are complete.
     """
-    url = f"{base_url}/finish_weight_update"
-    response = requests.post(url, timeout=60)
-    response.raise_for_status()
+    _HTTP.post("/finish_weight_update").raise_for_status()
 
 
-def pause_generation(base_url: str) -> None:
+def pause_generation() -> None:
     """Pause generation via HTTP endpoint."""
-    url = f"{base_url}/pause"
-    response = requests.post(url, timeout=60)
-    response.raise_for_status()
+    _HTTP.post("/pause").raise_for_status()
 
 
-def resume_generation(base_url: str) -> None:
+def resume_generation() -> None:
     """Resume generation via HTTP endpoint."""
-    url = f"{base_url}/resume"
-    response = requests.post(url, timeout=60)
-    response.raise_for_status()
+    _HTTP.post("/resume").raise_for_status()
+
+
+def send_update_via_httpx(update_info) -> None:
+    """Custom ``send_mode`` callable: POST ``/update_weights`` via httpx.
+
+    Mirrors the engine's built-in ``send_mode="http"`` path but uses httpx
+    instead of requests (see the module-level note on why requests breaks after
+    ``torch.npu.set_device``).
+    """
+    fields = {
+        "names": update_info.names,
+        "dtype_names": update_info.dtype_names,
+        "shapes": update_info.shapes,
+        "packed": update_info.packed,
+    }
+    if update_info.tensor_sizes is not None:
+        fields["tensor_sizes"] = update_info.tensor_sizes
+    fields["ipc_handles_pickled"] = base64.b64encode(pickle.dumps(update_info.ipc_handles)).decode("utf-8")
+    _HTTP.post("/update_weights", json={"update_info": fields}).raise_for_status()
 
 
 def main():
@@ -160,29 +179,29 @@ def main():
 
     # Initialize weight transfer on vLLM server (no-op for NPU IPC)
     print("Initializing weight transfer (NPU IPC backend)...")
-    init_weight_transfer_engine(BASE_URL)
+    init_weight_transfer_engine()
 
     # Pause generation before weight sync
-    pause_generation(BASE_URL)
+    pause_generation()
 
     # Start weight update (prepares layerwise reload on the vLLM server)
-    start_weight_update(BASE_URL)
+    start_weight_update()
 
-    # Send weights via NPU IPC handles using HTTP mode.
-    # trainer_send_weights internally collects all parameters,
-    # creates IPC handles, and POSTs them to /update_weights.
+    # Send weights via NPU IPC handles. We pass a custom ``send_mode`` callable
+    # (httpx) instead of "http" so the /update_weights POST does not go through
+    # requests, which breaks after torch.npu.set_device.
     print("Broadcasting weights via NPU IPC (HTTP)...")
-    trainer_args = NPUIPCTrainerSendWeightsArgs(send_mode="http", url=BASE_URL)
+    trainer_args = NPUIPCTrainerSendWeightsArgs(send_mode=send_update_via_httpx, url=BASE_URL)
     NPUIPCWeightTransferEngine.trainer_send_weights(
         iterator=train_model.named_parameters(),
         trainer_args=trainer_args,
     )
 
     # Finish weight update (finalizes layerwise reload on the vLLM server)
-    finish_weight_update(BASE_URL)
+    finish_weight_update()
 
     # Resume generation after weight sync
-    resume_generation(BASE_URL)
+    resume_generation()
 
     # Generate text after weight update. The output is expected to be normal
     # because the real weights are now loaded.
