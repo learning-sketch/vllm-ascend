@@ -11,41 +11,55 @@ process group, so a SINGLE trainer process can update an arbitrary
 
 * The vLLM server runs N workers on chips ``0..N-1`` (HCCL ranks ``1..N``).
 * The trainer is a single process on its own chip ``N`` (HCCL rank ``0``).
-* The trainer holds a full (unsharded) copy of the model and broadcasts each
-  tensor to all workers; every worker shards the full tensor locally on load.
-  Do NOT pre-shard the trainer weights.
+* The trainer broadcasts each full (unsharded) tensor to all workers; every
+  worker shards the full tensor locally on load. Do NOT pre-shard the weights.
 
 So this needs N + 1 NPUs total (N for inference + 1 for the trainer).
 
-Prerequisites:
-    Start a TP=N vLLM server with the HCCL weight-transfer backend. Pin it to
-    chips ``0..N-1`` so the trainer can own chip ``N`` exclusively. Example for
-    N=2 (needs 3 NPUs)::
+Memory: the trainer model stays on CPU and each parameter is streamed to the NPU
+just before it is broadcast (and freed after), so the full model is never
+resident on the trainer's NPU -- only the packed broadcast buffer plus the
+current tensor. This lets a single trainer NPU drive a model far larger than one
+chip (the inference side is still sharded across the N workers).
 
-        VLLM_SERVER_DEV_MODE=1 ASCEND_RT_VISIBLE_DEVICES=0,1 \
-            vllm serve Qwen/Qwen3-0.6b --enforce-eager \
+Fused MoE: recent HF MoE checkpoints (e.g. Qwen3-MoE) store all experts of a
+layer in fused tensors (``experts.gate_up_proj`` / ``experts.down_proj``), which
+vLLM's FusedMoE loader cannot match. They are expanded on the fly into the
+per-expert names vLLM expects (``experts.{e}.gate_proj/up_proj/down_proj.weight``).
+
+Prerequisites:
+    Start a TP=N vLLM server with the HCCL weight-transfer backend, pinned to
+    chips ``0..N-1`` so the trainer can own chip ``N``. Start it with
+    ``--enforce-eager`` (aclgraph + layerwise reload can otherwise fail/hang) and,
+    for MoE, the worker-side patch that preserves the fused-expert
+    ``weight_loader`` across updates (see
+    ``examples/rl/npu_moe_weight_loader_patch.py``). Example for N=4::
+
+        PYTHONPATH=examples/rl:$PYTHONPATH \
+        VLLM_SERVER_DEV_MODE=1 VLLM_ASCEND_ENABLE_NZ=0 \
+            ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+            vllm serve /path/to/Qwen3.5-35B-A3B --enforce-eager \
             --weight-transfer-config '{"backend": "nccl"}' \
             --load-format dummy \
-            --tensor-parallel-size 2
+            --tensor-parallel-size 4 --enable-expert-parallel \
+            --gpu-memory-utilization 0.5 \
+            --worker-extension-cls npu_moe_weight_loader_patch.MoEWeightLoaderWorkerExtension
 
-    Then run this script (single process, no torchrun needed)::
+    Then run this script (single process, no torchrun needed). It uses NPU chip
+    ``N`` (= inference_world_size), so make that chip visible to the trainer::
 
-        python rlhf_http_hccl_tp.py
-
-The example generates text before and after the weight update to show the
-server switching from dummy weights to the broadcast weights.
+        MODEL_NAME=/path/to/Qwen3.5-35B-A3B python rlhf_http_hccl_tp.py
 
 Note on HTTP transport:
     After setting the NPU device (CANN init) this process can no longer open new
-    TCP connections to the local server from an HTTP client that was constructed
-    AFTER set_device (connect hangs until timeout). So we construct the OpenAI
-    client BEFORE set_device and reuse its httpx transport (``client._client``)
-    for every control-plane / weight-update call. ``get_world_size`` runs before
-    set_device too, so it uses a plain request.
+    TCP connections to the local server from a client constructed AFTER
+    set_device. So we construct the httpx/OpenAI client BEFORE set_device and
+    reuse it for every control-plane / weight-update call.
 """
 
 import os
 import threading
+from collections.abc import Iterator
 
 import httpx
 import torch
@@ -64,6 +78,8 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-0.6B")
 # USE_CHAT=1 -> /v1/chat/completions (applies the chat template); else /v1/completions.
 USE_CHAT = os.environ.get("USE_CHAT", "0") == "1"
 
+PACKED_BUFFER_HEADROOM_BYTES = 128 * 2**20  # 128 MiB on top of the largest tensor
+
 # Shared httpx client, created in ``main`` BEFORE set_device and used as the
 # OpenAI transport; see the module docstring on why this ordering is required.
 _HTTP: httpx.Client | None = None
@@ -73,6 +89,37 @@ def is_multimodal_model(model_name: str) -> bool:
     """True if the HF config exposes a ``vision_config`` (multimodal model)."""
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     return hasattr(config, "vision_config")
+
+
+def iter_vllm_named_params(
+    model: torch.nn.Module, is_multimodal: bool
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield (vllm_name, cpu_tensor) for every weight, expanding fused MoE experts.
+
+    Tensors are CPU views (no NPU copy here) so this is cheap to iterate twice:
+    once to collect the names/shapes metadata and once to broadcast. Both passes
+    MUST yield the exact same sequence so the packed producer (trainer) and
+    consumer (server) agree on chunk boundaries -- they do, since this is
+    deterministic for a given model.
+
+    Multimodal models expose their language model under a ``language_model.``
+    prefix on the vLLM side. Fused MoE experts are split into per-expert names.
+    """
+    prefix = "language_model." if is_multimodal else ""
+    for name, param in model.named_parameters():
+        p = param.detach()
+        if name.endswith("mlp.experts.gate_up_proj"):
+            base = prefix + name[: -len("gate_up_proj")]  # ...mlp.experts.
+            half = p.shape[1] // 2  # rows [:half] = gate, [half:] = up
+            for e in range(p.shape[0]):
+                yield f"{base}{e}.gate_proj.weight", p[e, :half, :]
+                yield f"{base}{e}.up_proj.weight", p[e, half:, :]
+        elif name.endswith("mlp.experts.down_proj"):
+            base = prefix + name[: -len("down_proj")]
+            for e in range(p.shape[0]):
+                yield f"{base}{e}.down_proj.weight", p[e]
+        else:
+            yield prefix + name, p
 
 
 def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list[str]:
@@ -93,12 +140,9 @@ def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list
     return results
 
 
-def get_world_size(base_url: str) -> int:
-    """Get the inference world size from the vLLM server (TP * PP * DP).
-
-    Called BEFORE the NPU device is set, so a plain request works here.
-    """
-    response = httpx.get(f"{base_url}/get_world_size", timeout=10.0)
+def get_world_size() -> int:
+    """Get the inference world size from the vLLM server (TP * PP * DP)."""
+    response = _HTTP.get(f"{BASE_URL}/get_world_size", timeout=10.0)
     response.raise_for_status()
     return response.json()["world_size"]
 
@@ -132,7 +176,7 @@ def update_weights(
     update_info = dict(names=names, dtype_names=dtype_names, shapes=shapes, packed=packed)
     if packed and packed_buffer_size_bytes is not None:
         update_info["packed_buffer_size_bytes"] = packed_buffer_size_bytes
-    _HTTP.post(f"{BASE_URL}/update_weights", json={"update_info": update_info}, timeout=300.0).raise_for_status()
+    _HTTP.post(f"{BASE_URL}/update_weights", json={"update_info": update_info}, timeout=600.0).raise_for_status()
 
 
 def start_weight_update(is_checkpoint_format: bool = True) -> None:
@@ -154,37 +198,29 @@ def resume_generation() -> None:
 
 
 def main():
-    # Query the inference world size (= TP * PP * DP) BEFORE setting the device.
-    inference_world_size = get_world_size(BASE_URL)
-    world_size = inference_world_size + 1  # +1 for the trainer (HCCL rank 0)
-
-    # Create the OpenAI client BEFORE set_device and reuse its httpx transport for
-    # every control-plane / weight-update call. This ordering is REQUIRED: a
-    # client constructed AFTER the NPU device is set cannot open connections to
-    # the local server afterwards (connect hangs until timeout), whereas one
-    # constructed before connects fine even when the first request is sent later.
+    # Create the OpenAI/httpx client BEFORE set_device (see the module docstring),
+    # and reuse it for every control-plane / weight-update call.
     global _HTTP
-    _HTTP = httpx.Client(trust_env=False, timeout=300.0, limits=httpx.Limits(keepalive_expiry=600.0))
+    _HTTP = httpx.Client(trust_env=False, timeout=600.0, limits=httpx.Limits(keepalive_expiry=600.0))
     client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY", http_client=_HTTP)
 
-    # The trainer owns the chip just past the inference chips (0..N-1 are workers,
-    # so the trainer uses chip N). This needs N + 1 NPUs total.
+    inference_world_size = get_world_size()
+    world_size = inference_world_size + 1  # +1 for the trainer (HCCL rank 0)
+
+    # The trainer owns the chip just past the inference chips (0..N-1 are workers).
     device = f"npu:{inference_world_size}"
     torch.npu.set_device(inference_world_size)
 
-    print(f"Loading training model: {MODEL_NAME} on {device} (inference_world_size={inference_world_size})")
+    # Keep the trainer model on CPU; stream each parameter to the NPU only when it
+    # is broadcast (see iter_vllm_named_params / the broadcast iterator below).
+    print(f"Loading training model on CPU (streamed to {device}): {MODEL_NAME}")
     train_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16)
-    train_model.to(device)
     train_model.eval()
-    # Multimodal models expose their language model under a ``language_model.``
-    # prefix on the vLLM side; map the trainer param names accordingly.
     is_multimodal = is_multimodal_model(MODEL_NAME)
 
     prompts = [
         "Hello, my name is",
-        "The president of the United States is",
         "The capital of France is",
-        "The future of AI is",
     ]
 
     print("-" * 50)
@@ -217,18 +253,18 @@ def main():
     pause_generation()
     start_weight_update()
 
-    # Collect parameter metadata and size the packed buffer to fit the largest
-    # tensor (+128 MiB headroom), keeping the 1 GiB default as a floor.
+    # Collect parameter metadata (post MoE expansion) and size the packed buffer
+    # to fit the largest single tensor (+headroom), keeping a 1 GiB floor.
     names: list[str] = []
     dtype_names: list[str] = []
     shapes: list[list[int]] = []
     max_tensor_bytes = 0
-    for name, p in train_model.named_parameters():
-        names.append(f"language_model.{name}" if is_multimodal else name)
-        dtype_names.append(str(p.dtype).split(".")[-1])
-        shapes.append(list(p.shape))
-        max_tensor_bytes = max(max_tensor_bytes, p.numel() * p.element_size())
-    packed_buffer_size_bytes = max(max_tensor_bytes + 128 * 2**20, 2**30)
+    for name, tensor in iter_vllm_named_params(train_model, is_multimodal):
+        names.append(name)
+        dtype_names.append(str(tensor.dtype).split(".")[-1])
+        shapes.append(list(tensor.shape))
+        max_tensor_bytes = max(max_tensor_bytes, tensor.numel() * tensor.element_size())
+    packed_buffer_size_bytes = max(max_tensor_bytes + PACKED_BUFFER_HEADROOM_BYTES, 2**30)
 
     # update_weights blocks on the server while it waits for HCCL broadcasts, so
     # run it in a thread while the trainer produces the data.
@@ -238,14 +274,20 @@ def main():
     )
     update_thread.start()
 
-    print("Broadcasting weights via HCCL (packed)...")
+    # Broadcast in the SAME order as the metadata above, streaming each tensor to
+    # the NPU just-in-time (the packed producer frees each chunk after broadcast).
+    def broadcast_iter() -> Iterator[tuple[str, torch.Tensor]]:
+        for name, tensor in iter_vllm_named_params(train_model, is_multimodal):
+            yield name, tensor.to(device)
+
+    print(f"Broadcasting weights via HCCL (packed, buffer={packed_buffer_size_bytes / 2**20:.0f} MiB)...")
     trainer_args = HCCLTrainerSendWeightsArgs(
         group=model_update_group,
         packed=True,
         packed_buffer_size_bytes=packed_buffer_size_bytes,
     )
     HCCLWeightTransferEngine.trainer_send_weights(
-        iterator=train_model.named_parameters(),
+        iterator=broadcast_iter(),
         trainer_args=trainer_args,
     )
     update_thread.join()
