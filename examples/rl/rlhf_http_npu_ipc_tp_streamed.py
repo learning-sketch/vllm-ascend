@@ -42,10 +42,17 @@ Prerequisites (TP=2 shown; needs 2 NPUs):
 
     torchrun --nproc-per-node=2 rlhf_http_npu_ipc_tp_streamed.py
 
-``--enforce-eager`` is REQUIRED for weight transfer: with aclgraph enabled the
-model parameters lose their ``weight_loader`` attribute after capture, so the
-layerwise reload fails ("'Parameter' object has no attribute 'weight_loader'")
-or hangs. MoE models additionally need ``--enable-expert-parallel`` as usual.
+For weight transfer, start the server with ``--enforce-eager`` (aclgraph +
+layerwise reload can otherwise fail or hang). MoE models additionally need
+``--enable-expert-parallel``.
+
+MoE note: ``AscendFusedMoE.process_weights_after_loading`` re-creates the fused
+expert params on the first load and drops their ``weight_loader``, so a second
+load (this weight update) fails with "'Parameter' object has no attribute
+'weight_loader'". Start the server with the worker-side patch in
+``examples/rl/npu_moe_weight_loader_patch.py`` to fix it:
+``--worker-extension-cls npu_moe_weight_loader_patch.MoEWeightLoaderWorkerExtension``
+(put examples/rl on PYTHONPATH).
 """
 
 import base64
