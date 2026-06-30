@@ -41,6 +41,11 @@ Prerequisites (TP=2 shown; needs 2 NPUs):
         --gpu-memory-utilization 0.7
 
     torchrun --nproc-per-node=2 rlhf_http_npu_ipc_tp_streamed.py
+
+``--enforce-eager`` is REQUIRED for weight transfer: with aclgraph enabled the
+model parameters lose their ``weight_loader`` attribute after capture, so the
+layerwise reload fails ("'Parameter' object has no attribute 'weight_loader'")
+or hangs. MoE models additionally need ``--enable-expert-parallel`` as usual.
 """
 
 import base64
