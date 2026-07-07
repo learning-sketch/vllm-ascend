@@ -32,90 +32,146 @@ The example performs the following steps:
   the vLLM server using NPU IPC handles (via HTTP). The pause/resume is
   handled by ``trainer_send_weights`` — it calls ``update_weights`` internally.
 * Generate text again to show normal output after the weight update.
+
+For the tensor-parallel (TP > 1) workflow, see
+``examples/rl/rlhf_http_npu_ipc_tp.py``.
 """
 
+import base64
 import os
+import pickle
 
-import requests
+import httpx
 import torch
 from openai import OpenAI
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
     NPUIPCTrainerSendWeightsArgs,
     NPUIPCWeightTransferEngine,
 )
 
-BASE_URL = "http://localhost:8000"
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+# IMPORTANT: use httpx, not requests, for all trainer -> server HTTP.
+#
+# After ``torch.npu.set_device`` (CANN/torch_npu init), ``requests``/urllib3 can
+# no longer open NEW TCP connections to the local server -- ``connect`` hangs
+# until timeout -- even though a raw ``socket.create_connection`` (and httpx,
+# which uses it under the hood) connects instantly. So we route every call
+# through httpx, including the ``/update_weights`` POST that the engine would
+# otherwise make with ``requests`` (we pass a custom ``send_mode`` callable for
+# that). 127.0.0.1 (IPv4) also avoids any localhost->::1 resolution stalls.
+BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
+# Override with e.g. MODEL_NAME=/path/to/model ; must match the served model.
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-0.6B")
+# USE_CHAT=1 -> /v1/chat/completions (applies the chat template); else /v1/completions.
+USE_CHAT = os.environ.get("USE_CHAT", "0") == "1"
 
 # Enable insecure serialization for IPC handle serialization over HTTP
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+# Shared httpx client, created in ``main`` BEFORE setting the NPU device and used
+# as the OpenAI transport. A client constructed AFTER set_device (CANN init)
+# cannot open new TCP connections to the local server (connect hangs); one
+# constructed BEFORE can, including reconnects after an idle connection is
+# dropped by the server's keep-alive timeout during the weight transfer.
+_HTTP: httpx.Client | None = None
+
 
 def generate_completions(client: OpenAI, model: str, prompts: list[str]) -> list[str]:
-    """Generate completions using the OpenAI-compatible API."""
+    """Generate via /v1/chat/completions when USE_CHAT, else /v1/completions."""
     results = []
     for prompt in prompts:
-        response = client.completions.create(
-            model=model,
-            prompt=prompt,
-            max_tokens=32,
-            temperature=0,
-        )
-        results.append(response.choices[0].text)
+        if USE_CHAT:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=32,
+                temperature=0,
+            )
+            results.append(response.choices[0].message.content)
+        else:
+            response = client.completions.create(model=model, prompt=prompt, max_tokens=32, temperature=0)
+            results.append(response.choices[0].text)
     return results
 
 
-def init_weight_transfer_engine(base_url: str) -> None:
+def init_weight_transfer_engine() -> None:
     """Initialize weight transfer via HTTP endpoint (no-op for NPU IPC)."""
-    url = f"{base_url}/init_weight_transfer_engine"
-    payload: dict[str, dict] = {"init_info": {}}
-    response = requests.post(url, json=payload, timeout=60)
-    response.raise_for_status()
+    _HTTP.post(f"{BASE_URL}/init_weight_transfer_engine", json={"init_info": {}}).raise_for_status()
 
 
-def start_weight_update(base_url: str, is_checkpoint_format: bool = True) -> None:
+def start_weight_update(is_checkpoint_format: bool = True) -> None:
     """Start weight update via HTTP endpoint.
 
     Prepares the model for layerwise reload on the vLLM server side.
     Must be called before update_weights.
     """
-    url = f"{base_url}/start_weight_update"
-    payload = {"is_checkpoint_format": is_checkpoint_format}
-    response = requests.post(url, json=payload, timeout=60)
-    response.raise_for_status()
+    _HTTP.post(f"{BASE_URL}/start_weight_update", json={"is_checkpoint_format": is_checkpoint_format}).raise_for_status()
 
 
-def finish_weight_update(base_url: str) -> None:
+def finish_weight_update() -> None:
     """Finish weight update via HTTP endpoint.
 
     Finalizes layerwise reload on the vLLM server side.
     Must be called after all update_weights calls are complete.
     """
-    url = f"{base_url}/finish_weight_update"
-    response = requests.post(url, timeout=60)
-    response.raise_for_status()
+    _HTTP.post(f"{BASE_URL}/finish_weight_update").raise_for_status()
 
 
-def pause_generation(base_url: str) -> None:
+def pause_generation() -> None:
     """Pause generation via HTTP endpoint."""
-    url = f"{base_url}/pause"
-    response = requests.post(url, timeout=60)
-    response.raise_for_status()
+    _HTTP.post(f"{BASE_URL}/pause").raise_for_status()
 
 
-def resume_generation(base_url: str) -> None:
+def resume_generation() -> None:
     """Resume generation via HTTP endpoint."""
-    url = f"{base_url}/resume"
-    response = requests.post(url, timeout=60)
-    response.raise_for_status()
+    _HTTP.post(f"{BASE_URL}/resume").raise_for_status()
+
+
+def is_multimodal_model(model_name: str) -> bool:
+    """True if the HF config exposes a ``vision_config`` (multimodal model)."""
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    return hasattr(config, "vision_config")
+
+
+def mapped_named_params(model: torch.nn.Module, is_multimodal: bool):
+    """Yield (vllm_name, param). Multimodal models expose their language model
+    under a ``language_model.`` prefix on the vLLM side."""
+    for name, param in model.named_parameters():
+        vllm_name = f"language_model.{name}" if is_multimodal else name
+        yield vllm_name, param
+
+
+def send_update_via_httpx(update_info) -> None:
+    """Custom ``send_mode`` callable: POST ``/update_weights`` via httpx.
+
+    Mirrors the engine's built-in ``send_mode="http"`` path but uses httpx
+    instead of requests (see the module-level note on why requests breaks after
+    setting the NPU device).
+    """
+    fields = {
+        "names": update_info.names,
+        "dtype_names": update_info.dtype_names,
+        "shapes": update_info.shapes,
+        "packed": update_info.packed,
+    }
+    if update_info.tensor_sizes is not None:
+        fields["tensor_sizes"] = update_info.tensor_sizes
+    fields["ipc_handles_pickled"] = base64.b64encode(pickle.dumps(update_info.ipc_handles)).decode("utf-8")
+    _HTTP.post(f"{BASE_URL}/update_weights", json={"update_info": fields}).raise_for_status()
 
 
 def main():
     # NPU IPC requires the training model to be on the same NPU as the vLLM server.
     # The server should be started on NPU 0 with reduced memory utilization.
     device = "npu:0"
+
+    # Create the HTTP/OpenAI client BEFORE set_device (see the note at _HTTP), and
+    # use it as the OpenAI transport so generation and control-plane share it.
+    global _HTTP
+    _HTTP = httpx.Client(trust_env=False, timeout=300.0, limits=httpx.Limits(keepalive_expiry=600.0))
+    client = OpenAI(base_url=f"{BASE_URL}/v1", api_key="EMPTY", http_client=_HTTP)
+
     torch.accelerator.set_device_index(device)
 
     # Load the training model on the same NPU as the server.
@@ -128,12 +184,7 @@ def main():
     train_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16)
     train_model.to(device)
     train_model.eval()
-
-    # Create OpenAI client pointing to the vLLM server
-    client = OpenAI(
-        base_url=f"{BASE_URL}/v1",
-        api_key="EMPTY",
-    )
+    is_multimodal = is_multimodal_model(MODEL_NAME)
 
     # Test prompts
     prompts = [
@@ -155,29 +206,29 @@ def main():
 
     # Initialize weight transfer on vLLM server (no-op for NPU IPC)
     print("Initializing weight transfer (NPU IPC backend)...")
-    init_weight_transfer_engine(BASE_URL)
+    init_weight_transfer_engine()
 
     # Pause generation before weight sync
-    pause_generation(BASE_URL)
+    pause_generation()
 
     # Start weight update (prepares layerwise reload on the vLLM server)
-    start_weight_update(BASE_URL)
+    start_weight_update()
 
-    # Send weights via NPU IPC handles using HTTP mode.
-    # trainer_send_weights internally collects all parameters,
-    # creates IPC handles, and POSTs them to /update_weights.
+    # Send weights via NPU IPC handles. We pass a custom ``send_mode`` callable
+    # (httpx) instead of "http" so the /update_weights POST does not go through
+    # requests, which breaks after torch.npu.set_device.
     print("Broadcasting weights via NPU IPC (HTTP)...")
-    trainer_args = NPUIPCTrainerSendWeightsArgs(send_mode="http", url=BASE_URL)
+    trainer_args = NPUIPCTrainerSendWeightsArgs(send_mode=send_update_via_httpx, url=BASE_URL)
     NPUIPCWeightTransferEngine.trainer_send_weights(
-        iterator=train_model.named_parameters(),
+        iterator=mapped_named_params(train_model, is_multimodal),
         trainer_args=trainer_args,
     )
 
     # Finish weight update (finalizes layerwise reload on the vLLM server)
-    finish_weight_update(BASE_URL)
+    finish_weight_update()
 
     # Resume generation after weight sync
-    resume_generation(BASE_URL)
+    resume_generation()
 
     # Generate text after weight update. The output is expected to be normal
     # because the real weights are now loaded.
