@@ -154,6 +154,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+vllm-empty/
 env/
 venv/
 ENV/
